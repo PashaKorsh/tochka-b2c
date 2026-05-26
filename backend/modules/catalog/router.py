@@ -28,6 +28,7 @@ from fastapi.responses import JSONResponse
 from backend import config
 from backend.modules.catalog.schemas import (
     ALLOWED_SORT_VALUES,
+    CatalogProductCard,
     CatalogProductDetail,
     ErrorResponse,
     FacetsResponse,
@@ -378,3 +379,76 @@ async def get_catalog_product(
         )
 
     return detail
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/products/{product_id}/similar
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/products/{product_id}/similar",
+    response_model=list[CatalogProductCard],
+    responses={
+        200: {"description": "Список похожих товаров (может быть пустым)"},
+        404: {"model": ErrorResponse, "description": "Товар не найден"},
+        502: {"model": ErrorResponse, "description": "B2B недоступен"},
+    },
+    summary="Похожие товары (US-B2C-04)",
+    description="""
+    Возвращает массив похожих товаров из той же категории.
+    Текущий товар исключён из результата.
+    Нет похожих → пустой список [].
+
+    Алгоритм (canon b2c-catalog-flows.md#b2c-4-similar-products):
+      1. GET product из B2B → извлечь category_id (404 если не найден)
+      2. GET /api/v1/public/products?category={category_id} → случайная выборка
+      3. Исключить текущий товар из результата
+      4. Вернуть до limit элементов
+
+    Fallback на родительскую категорию не реализован в MVP
+    (B2C не имеет эндпоинта для получения иерархии категорий).
+
+    ADR (выборка): случайная (ORDER BY RANDOM() в B2B) vs характеристики vs кэш.
+    Выбрана случайная: нет инфры, результат свежий при каждом запросе.
+
+    Spec b2c/openapi.yaml: limit min=1 max=50, default=10.
+    """,
+)
+async def get_similar_products(
+    product_id: UUID = Path(..., description="UUID текущего товара"),
+    limit: int = Query(10, ge=1, le=50, description="Максимальное число похожих"),
+) -> list[CatalogProductCard] | JSONResponse:
+    """
+    GET /api/v1/catalog/products/{product_id}/similar — similar products (US-B2C-04).
+
+    Canon test scenarios:
+    - similar_returns_up_to_8_from_same_category
+    - empty_category_returns_200_empty_list
+    - unknown_product_returns_404
+    - similar_excludes_current_product
+    - b2b_unavailable_returns_502
+    """
+    try:
+        result = await CatalogService.get_similar(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+            product_id=product_id,
+            limit=limit,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "message": "Product not found"},
+            )
+        return _upstream_error(f"B2B returned {exc.response.status_code}")
+
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "message": "Product not found"},
+        )
+
+    return result
