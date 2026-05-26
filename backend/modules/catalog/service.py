@@ -29,6 +29,10 @@ from backend.modules.catalog.schemas import (
     ALLOWED_SORT_VALUES,
     B2B_SORT_MAP,
     CatalogProductCard,
+    CatalogProductDetail,
+    CatalogSkuImageRef,
+    CatalogSkuResponse,
+    CharacteristicRef,
     Facet,
     FacetValue,
     FacetsResponse,
@@ -219,3 +223,144 @@ class CatalogService:
             items = [i for i in items if (i.get("min_price") or 0) <= filter_price_max]
 
         return _compute_facets(items, filter_category_id)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Product detail helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _b2b_sku_to_catalog(sku: dict[str, Any]) -> CatalogSkuResponse:
+    """
+    Transform a B2B SKUPublicResponse dict into a buyer-safe CatalogSkuResponse.
+
+    Security (CLAUDE.md §5, US-B2C-03):
+      B2B's service-mode response already omits cost_price / reserved_quantity.
+      The explicit CatalogSkuResponse schema guarantees they cannot appear even
+      if B2B accidentally adds them (extra fields are dropped by Pydantic).
+
+    Price convention (canon b2c-catalog-flows.md#b2c-3-product-card):
+      B2B.price    = base / list price
+      B2B.discount = discount amount in kopecks
+      B2C.price    = B2B.price - B2B.discount   (actual selling price)
+      B2C.old_price = B2B.price when discount > 0, else None (strikethrough)
+    """
+    base_price: int = sku.get("price", 0)
+    discount: int = sku.get("discount", 0)
+    effective_price = base_price - discount
+    old_price: Optional[int] = base_price if discount > 0 else None
+
+    available_qty: int = sku.get("active_quantity", 0)
+
+    raw_images = sku.get("images", [])
+    images = [
+        CatalogSkuImageRef(
+            id=img["id"],
+            url=img["url"],
+            ordering=img.get("ordering", 0),
+        )
+        for img in raw_images
+    ]
+
+    raw_chars = sku.get("characteristics", [])
+    characteristics = [
+        CharacteristicRef(name=c["name"], value=c["value"]) for c in raw_chars
+    ]
+
+    return CatalogSkuResponse(
+        id=UUID(sku["id"]),
+        name=sku.get("name"),
+        sku_code=sku.get("article"),
+        price=effective_price,
+        old_price=old_price,
+        available_quantity=available_qty,
+        in_stock=available_qty > 0,
+        images=images,
+        characteristics=characteristics,
+    )
+
+
+def _b2b_product_to_detail(data: dict[str, Any]) -> CatalogProductDetail:
+    """
+    Transform a B2B ProductPublicResponse dict into a CatalogProductDetail.
+
+    Visibility: caller must check data["status"] == "MODERATED" and
+    data["deleted"] == False before calling this; otherwise return 404.
+    """
+    raw_images = data.get("images", [])
+    images = [
+        ImageRef(
+            id=uuid.uuid5(uuid.NAMESPACE_URL, img["url"]),
+            url=img["url"],
+            ordering=img.get("ordering", 0),
+        )
+        for img in raw_images
+    ]
+
+    skus = [_b2b_sku_to_catalog(s) for s in data.get("skus", [])]
+    has_stock = any(s.available_quantity > 0 for s in skus)
+    min_price = min((s.price for s in skus), default=0)
+
+    raw_chars = data.get("characteristics", [])
+    characteristics = [CharacteristicRef(name=c["name"], value=c["value"]) for c in raw_chars]
+
+    return CatalogProductDetail(
+        id=UUID(data["id"]),
+        name=data["title"],
+        slug=data.get("slug"),
+        category_id=UUID(data["category_id"]) if data.get("category_id") else None,
+        min_price=min_price,
+        has_stock=has_stock,
+        images=images,
+        seller_id=UUID(data["seller_id"]) if data.get("seller_id") else None,
+        description=data.get("description", ""),
+        characteristics=characteristics,
+        skus=skus,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# get_product method (added to CatalogService class above)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Extend the class by monkey-patching in a classmethod-safe way would require
+# re-opening the class. Instead we add the method directly here and the router
+# calls it as CatalogService.get_product(...).
+
+async def _get_product(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+    product_id: UUID,
+) -> CatalogProductDetail | None:
+    """
+    Fetch a single product from B2B and return a buyer-safe CatalogProductDetail.
+
+    Returns None when:
+      - B2B returns 404 (product not found, deleted, or blocked)
+      - Product status != MODERATED or deleted == True (extra guard)
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{b2b_base_url}/api/v1/products/{product_id}",
+            headers={"X-Service-Key": service_key},
+        )
+
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+
+    data = resp.json()
+
+    # Extra visibility guard: B2B service mode should already exclude
+    # blocked/deleted, but we enforce it here to prevent data leaks.
+    if data.get("deleted") or data.get("status") != "MODERATED":
+        return None
+
+    return _b2b_product_to_detail(data)
+
+
+# Attach as a static method on CatalogService
+CatalogService.get_product = staticmethod(_get_product)  # type: ignore[attr-defined]
