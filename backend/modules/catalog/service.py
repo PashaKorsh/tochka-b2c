@@ -28,10 +28,15 @@ import httpx
 from backend.modules.catalog.schemas import (
     ALLOWED_SORT_VALUES,
     B2B_SORT_MAP,
+    BreadcrumbItem,
+    BreadcrumbMeta,
+    BreadcrumbResponse,
     CatalogProductCard,
     CatalogProductDetail,
     CatalogSkuImageRef,
     CatalogSkuResponse,
+    CategoryRef,
+    CategoryTreeNode,
     CharacteristicRef,
     Facet,
     FacetValue,
@@ -453,3 +458,346 @@ async def _get_similar(
 
 
 CatalogService.get_similar = staticmethod(_get_similar)  # type: ignore[attr-defined]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Category navigation helpers (US-B2C-05)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class OrphanNodeError(Exception):
+    """Raised when a category references a parent_id that doesn't exist."""
+
+
+def _b2b_cat_to_ref(item: dict[str, Any]) -> CategoryRef:
+    """
+    Convert a B2B CategoryResponse dict → B2C CategoryRef.
+
+    B2B path is a materialized path string ("electronics/phones").
+    B2C path is an array of strings — we split on "/".
+    """
+    raw_path: str = item.get("path") or ""
+    path_parts = [p for p in raw_path.split("/") if p]
+    return CategoryRef(
+        id=UUID(item["id"]),
+        name=item["name"],
+        parent_id=UUID(item["parent_id"]) if item.get("parent_id") else None,
+        level=item.get("level", 0),
+        path=path_parts,
+    )
+
+
+def _check_orphans(flat: list[dict[str, Any]]) -> None:
+    """
+    Raise OrphanNodeError if any category references a parent_id that is not
+    in the flat list.
+
+    Algorithm: adjacency-list orphan detection (O(n)):
+      1. Collect all IDs into a set.
+      2. For each item, if parent_id is non-null and not in the set → orphan.
+    """
+    id_set = {item["id"] for item in flat}
+    for item in flat:
+        parent_id = item.get("parent_id")
+        if parent_id and parent_id not in id_set:
+            raise OrphanNodeError(
+                f"category {item['id']} references non-existent parent {parent_id}"
+            )
+
+
+def _build_tree(flat: list[dict[str, Any]]) -> list[CategoryTreeNode]:
+    """
+    Build a nested CategoryTreeNode tree from a flat B2B category list.
+
+    Pre-condition: _check_orphans(flat) must be called first.
+
+    ADR — adjacency list chosen over:
+      (a) ltree PostgreSQL — needs DB schema on B2C; B2C has no local category store.
+      (b) Materialized path — B2B already stores this; B2C would duplicate it.
+      (c) Adjacency list with in-memory traversal (chosen) — zero schema changes,
+          works with B2B's flat API response, O(n) tree build.
+    """
+    nodes: dict[str, CategoryTreeNode] = {}
+    for item in flat:
+        raw_path: str = item.get("path") or ""
+        path_parts = [p for p in raw_path.split("/") if p]
+        nodes[item["id"]] = CategoryTreeNode(
+            id=UUID(item["id"]),
+            name=item["name"],
+            parent_id=UUID(item["parent_id"]) if item.get("parent_id") else None,
+            level=item.get("level", 0),
+            path=path_parts,
+            children=[],
+        )
+
+    roots: list[CategoryTreeNode] = []
+    for item in flat:
+        node = nodes[item["id"]]
+        parent_id = item.get("parent_id")
+        if parent_id and parent_id in nodes:
+            nodes[parent_id].children.append(node)
+        else:
+            roots.append(node)
+
+    return roots
+
+
+def _build_breadcrumb_chain(
+    flat: list[dict[str, Any]],
+    target_id: str,
+) -> list[dict[str, Any]]:
+    """
+    Walk up the adjacency list from target_id to root.
+
+    Returns: list of CategoryResponse dicts ordered root → current.
+
+    Raises:
+      OrphanNodeError — if the chain reaches a parent_id not in the flat list
+                        (broken hierarchy) or a cycle is detected.
+    """
+    by_id = {item["id"]: item for item in flat}
+
+    if target_id not in by_id:
+        return []   # caller interprets as 404
+
+    chain: list[dict[str, Any]] = []
+    current_id: Optional[str] = target_id
+    visited: set[str] = set()
+
+    while current_id is not None:
+        if current_id in visited:
+            raise OrphanNodeError(f"cycle detected at category {current_id}")
+        visited.add(current_id)
+
+        node = by_id.get(current_id)
+        if node is None:
+            raise OrphanNodeError(
+                f"parent category {current_id} referenced but not in flat list"
+            )
+        chain.append(node)
+        current_id = node.get("parent_id")
+
+    chain.reverse()  # root → current
+
+    # Extra guard: root must have level == 0
+    if chain and chain[0].get("level", 0) != 0:
+        raise OrphanNodeError(
+            "breadcrumb chain does not start from a root category (level 0)"
+        )
+
+    return chain
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Category service methods
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _list_categories(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+) -> list[CategoryRef]:
+    """
+    Return flat list of all categories from B2B.
+
+    B2B endpoint: GET /api/v1/categories (read-open, no auth required).
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+      OrphanNodeError — caller maps to 422.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{b2b_base_url}/api/v1/categories",
+            headers={"X-Service-Key": service_key},
+        )
+    resp.raise_for_status()
+    flat: list[dict[str, Any]] = resp.json()
+
+    _check_orphans(flat)
+    return [_b2b_cat_to_ref(item) for item in flat]
+
+
+async def _get_category_tree(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+) -> list[CategoryTreeNode]:
+    """
+    Return full nested category tree, built in-memory from B2B flat list.
+
+    ADR (tree construction strategy):
+      Three approaches considered:
+        (a) Use B2B /api/v1/categories/tree directly — simplest, but returns
+            CategoryTreeResponse (id, name, children only; no level/parent_id
+            for orphan detection).
+        (b) Fetch flat list + build in-memory (chosen) — enables orphan detection
+            via parent_id validation before tree construction. O(n) build.
+        (c) ltree PostgreSQL — requires a local B2C schema for categories, violating
+            the B2C-is-proxy principle.
+      Criteria: (1) orphan detection is a hard DoD requirement → flat + in-memory
+      wins; (2) minimal infra — no extra B2C DB table needed.
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+      OrphanNodeError — caller maps to 422.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{b2b_base_url}/api/v1/categories",
+            headers={"X-Service-Key": service_key},
+        )
+    resp.raise_for_status()
+    flat: list[dict[str, Any]] = resp.json()
+
+    _check_orphans(flat)
+    return _build_tree(flat)
+
+
+async def _get_category(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+    category_id: UUID,
+) -> CategoryTreeNode | None:
+    """
+    Return a single category with its direct children.
+
+    B2B endpoint: GET /api/v1/categories/{category_id} →
+        CategoryWithChildrenResponse (allOf CategoryResponse + children[]).
+
+    Returns None if B2B returns 404.
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+    """
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(
+            f"{b2b_base_url}/api/v1/categories/{category_id}",
+            headers={"X-Service-Key": service_key},
+        )
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+
+    data = resp.json()
+    raw_path: str = data.get("path") or ""
+    path_parts = [p for p in raw_path.split("/") if p]
+
+    children = [
+        CategoryTreeNode(
+            id=UUID(child["id"]),
+            name=child["name"],
+            parent_id=UUID(child["parent_id"]) if child.get("parent_id") else None,
+            level=child.get("level", 0),
+            path=[p for p in (child.get("path") or "").split("/") if p],
+            children=[],
+        )
+        for child in data.get("children", [])
+    ]
+
+    return CategoryTreeNode(
+        id=UUID(data["id"]),
+        name=data["name"],
+        parent_id=UUID(data["parent_id"]) if data.get("parent_id") else None,
+        level=data.get("level", 0),
+        path=path_parts,
+        children=children,
+    )
+
+
+async def _get_breadcrumbs(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+    category_id: Optional[UUID],
+    product_id: Optional[UUID],
+) -> BreadcrumbResponse | None:
+    """
+    Build breadcrumb chain for a category or product.
+
+    Algorithm (canon b2c-catalog-flows.md#b2c-5-category-nav §5d):
+      1. If product_id given: fetch product to resolve category_id.
+         Returns None if product not found / deleted / non-MODERATED.
+      2. Fetch flat category list from B2B.
+      3. Walk adjacency list from target category to root.
+      4. Detect orphan: if chain reaches a missing parent → 422.
+      5. Map to BreadcrumbItem list (root first, current last with is_current=True).
+
+    Returns:
+      BreadcrumbResponse — success.
+      None — category / product not found (caller returns 404).
+
+    Raises:
+      OrphanNodeError — caller returns 422.
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+    """
+    resolved_via: str
+    resolved_cat_id: Optional[UUID]
+    resolved_prod_id: Optional[UUID] = product_id
+
+    if product_id is not None:
+        # Step 1 — resolve product → category_id
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            prod_resp = await client.get(
+                f"{b2b_base_url}/api/v1/products/{product_id}",
+                headers={"X-Service-Key": service_key},
+            )
+        if prod_resp.status_code == 404:
+            return None
+        prod_resp.raise_for_status()
+        prod_data = prod_resp.json()
+        if prod_data.get("deleted") or prod_data.get("status") != "MODERATED":
+            return None
+        raw_cat = prod_data.get("category_id")
+        resolved_cat_id = UUID(raw_cat) if raw_cat else None
+        resolved_via = "product_id"
+    else:
+        resolved_cat_id = category_id
+        resolved_via = "category_id"
+
+    if resolved_cat_id is None:
+        return None  # no category available
+
+    # Step 2 — fetch flat category list
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        cat_resp = await client.get(
+            f"{b2b_base_url}/api/v1/categories",
+            headers={"X-Service-Key": service_key},
+        )
+    cat_resp.raise_for_status()
+    flat: list[dict[str, Any]] = cat_resp.json()
+
+    # Step 3-4 — walk chain (raises OrphanNodeError on broken hierarchy)
+    chain = _build_breadcrumb_chain(flat, str(resolved_cat_id))
+    if not chain:
+        return None  # category not found in flat list → 404
+
+    # Step 5 — map to BreadcrumbItem[]
+    items: list[BreadcrumbItem] = []
+    for i, node in enumerate(chain):
+        raw_path = node.get("path") or ""
+        slug = raw_path.split("/")[-1] if raw_path else node["name"].lower().replace(" ", "-")
+        url = f"/catalog/{raw_path}" if raw_path else None
+        is_current = (i == len(chain) - 1)
+        items.append(BreadcrumbItem(
+            id=UUID(node["id"]),
+            slug=slug,
+            name=node["name"],
+            url=url,
+            level=node.get("level", i),
+            is_current=is_current,
+        ))
+
+    meta = BreadcrumbMeta(
+        resolved_via=resolved_via,
+        category_id=resolved_cat_id,
+        product_id=resolved_prod_id,
+    )
+    return BreadcrumbResponse(data=items, meta=meta)
+
+
+# Attach to CatalogService
+CatalogService.list_categories = staticmethod(_list_categories)        # type: ignore[attr-defined]
+CatalogService.get_category_tree = staticmethod(_get_category_tree)    # type: ignore[attr-defined]
+CatalogService.get_category = staticmethod(_get_category)              # type: ignore[attr-defined]
+CatalogService.get_breadcrumbs = staticmethod(_get_breadcrumbs)        # type: ignore[attr-defined]

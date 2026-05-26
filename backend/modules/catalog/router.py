@@ -28,13 +28,16 @@ from fastapi.responses import JSONResponse
 from backend import config
 from backend.modules.catalog.schemas import (
     ALLOWED_SORT_VALUES,
+    BreadcrumbResponse,
     CatalogProductCard,
     CatalogProductDetail,
+    CategoryRef,
+    CategoryTreeNode,
     ErrorResponse,
     FacetsResponse,
     PaginatedCatalogProducts,
 )
-from backend.modules.catalog.service import CatalogService
+from backend.modules.catalog.service import CatalogService, OrphanNodeError
 
 router = APIRouter(prefix="/api/v1", tags=["Catalog"])
 
@@ -449,6 +452,202 @@ async def get_similar_products(
         return JSONResponse(
             status_code=404,
             content={"code": "NOT_FOUND", "message": "Product not found"},
+        )
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/categories  (US-B2C-05, spec b2c/openapi.yaml)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/categories",
+    summary="Flat category list",
+    response_model=list[CategoryRef],
+    tags=["Catalog"],
+)
+async def list_categories() -> list[CategoryRef] | JSONResponse:
+    """
+    GET /api/v1/catalog/categories — flat list of all categories.
+    spec b2c/openapi.yaml: response array of CategoryRef (no auth required).
+
+    DoD (US-B2C-05):
+    - category_tree_returns_nested_structure (tree endpoint)
+    - orphan_node_returns_422
+
+    B2B source: GET /api/v1/categories (read-open endpoint).
+    """
+    try:
+        return await CatalogService.list_categories(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+    except OrphanNodeError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"code": "ORPHAN_NODE", "message": f"category hierarchy is broken: {exc}"},
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/categories/tree  (US-B2C-05, spec b2c/openapi.yaml)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/categories/tree",
+    summary="Nested category tree",
+    response_model=list[CategoryTreeNode],
+    tags=["Catalog"],
+)
+async def get_category_tree() -> list[CategoryTreeNode] | JSONResponse:
+    """
+    GET /api/v1/catalog/categories/tree — full nested category tree.
+    spec b2c/openapi.yaml: response array of CategoryTreeNode.
+
+    DoD (US-B2C-05):
+    - category_tree_returns_nested_structure
+    - orphan_node_returns_422
+
+    Algorithm: fetch flat list from B2B, detect orphan nodes, build tree in-memory.
+    Cache-Control: max-age=3600 — categories change rarely.
+    """
+    try:
+        tree = await CatalogService.get_category_tree(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+    except OrphanNodeError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"code": "ORPHAN_NODE", "message": f"category hierarchy is broken: {exc}"},
+        )
+
+    from fastapi.responses import Response
+    import json
+
+    # Return with Cache-Control header (categories change rarely)
+    content = json.dumps([node.model_dump(mode="json") for node in tree])
+    return Response(
+        content=content,
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/categories/{category_id}  (US-B2C-05)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/categories/{category_id}",
+    summary="Category detail with direct children",
+    response_model=CategoryTreeNode,
+    tags=["Catalog"],
+)
+async def get_category(
+    category_id: UUID = Path(..., description="Category UUID"),
+) -> CategoryTreeNode | JSONResponse:
+    """
+    GET /api/v1/catalog/categories/{category_id} — category detail + direct children.
+
+    DoD (US-B2C-05):
+    - unknown_category_returns_404
+
+    B2B source: GET /api/v1/categories/{category_id} → CategoryWithChildrenResponse.
+    """
+    try:
+        result = await CatalogService.get_category(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+            category_id=category_id,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "message": "Category not found"},
+        )
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/breadcrumbs  (US-B2C-05)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/breadcrumbs",
+    summary="Navigation breadcrumb chain",
+    response_model=BreadcrumbResponse,
+    tags=["Catalog"],
+)
+async def get_breadcrumbs(
+    category_id: Optional[UUID] = Query(
+        None, description="UUID of the target category"
+    ),
+    product_id: Optional[UUID] = Query(
+        None, description="UUID of the product (resolves its category)"
+    ),
+) -> BreadcrumbResponse | JSONResponse:
+    """
+    GET /api/v1/catalog/breadcrumbs?category_id=|product_id=
+
+    Exactly ONE parameter required (canon b2c-catalog-flows.md#b2c-5-category-nav §5d).
+
+    DoD (US-B2C-05):
+    - breadcrumbs_return_path_from_root
+    - ambiguous_params_returns_400  (both params supplied → 400)
+    - orphan_node_returns_422        (broken hierarchy → 422)
+
+    Error codes:
+      400 INVALID_REQUEST  — both or neither param supplied.
+      404 NOT_FOUND        — unknown category / product.
+      422 ORPHAN_NODE      — category has no valid path to root.
+      502 UPSTREAM_UNAVAILABLE — B2B network error.
+    """
+    # Validate: exactly one of category_id / product_id must be provided
+    if category_id is not None and product_id is not None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": "only one of category_id or product_id must be provided",
+            },
+        )
+    if category_id is None and product_id is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": "category_id or product_id must be provided",
+            },
+        )
+
+    try:
+        result = await CatalogService.get_breadcrumbs(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+            category_id=category_id,
+            product_id=product_id,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+    except OrphanNodeError as exc:
+        return JSONResponse(
+            status_code=422,
+            content={"code": "ORPHAN_NODE", "message": f"category hierarchy is broken: {exc}"},
+        )
+
+    if result is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "message": "Category or product not found"},
         )
 
     return result

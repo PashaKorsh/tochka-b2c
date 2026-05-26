@@ -171,6 +171,69 @@ class FacetsResponse(BaseModel):
     facets: List[Facet]
 
 
+# ────────────────────────── Categories (US-B2C-05) ──────────────────────────
+
+class CategoryRef(BaseModel):
+    """
+    spec b2c/openapi.yaml#CategoryRef — flat category representation.
+    required: [id, name, level, path]
+    path: array of strings from root to current (breadcrumb names or slugs).
+    """
+    id: UUID
+    name: str
+    parent_id: Optional[UUID] = None
+    level: int
+    path: List[str] = Field(default_factory=list, description="Names from root to current")
+
+
+class CategoryTreeNode(CategoryRef):
+    """
+    spec b2c/openapi.yaml#CategoryTreeNode — nested category node.
+    allOf: CategoryRef + {children: [CategoryTreeNode]}
+    Used in GET /api/v1/catalog/categories/tree.
+    """
+    children: List["CategoryTreeNode"] = []
+
+    model_config = {"from_attributes": True}
+
+
+CategoryTreeNode.model_rebuild()
+
+
+# ────────────────────────── Breadcrumbs (US-B2C-05) ──────────────────────────
+
+class BreadcrumbItem(BaseModel):
+    """
+    canon b2c-catalog-flows.md#b2c-5-category-nav / b2c/catalog/openapi.yaml#breadcrumb_item.
+    required: [id, slug, name, level]
+    """
+    id: UUID
+    slug: str
+    name: str
+    url: Optional[str] = None
+    level: int
+    is_current: bool = False
+
+
+class BreadcrumbMeta(BaseModel):
+    """
+    canon b2c/catalog/openapi.yaml#breadcrumb_meta.
+    resolved_via: "category_id" | "product_id"
+    """
+    resolved_via: str
+    category_id: Optional[UUID] = None
+    product_id: Optional[UUID] = None
+
+
+class BreadcrumbResponse(BaseModel):
+    """
+    Response for GET /api/v1/catalog/breadcrumbs.
+    canon b2c-catalog-flows.md#b2c-5-category-nav (breadcrumb response shape).
+    """
+    data: List[BreadcrumbItem]
+    meta: BreadcrumbMeta
+
+
 # ────────────────────────── Error ──────────────────────────
 
 class ErrorResponse(BaseModel):
