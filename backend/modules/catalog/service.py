@@ -364,3 +364,92 @@ async def _get_product(
 
 # Attach as a static method on CatalogService
 CatalogService.get_product = staticmethod(_get_product)  # type: ignore[attr-defined]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Similar products (US-B2C-04)
+# ──────────────────────────────────────────────────────────────────────────────
+
+async def _get_similar(
+    *,
+    b2b_base_url: str,
+    service_key: str,
+    product_id: UUID,
+    limit: int = 10,
+) -> list[CatalogProductCard] | None:
+    """
+    Return up to `limit` public products from the same category as `product_id`,
+    excluding the product itself.
+
+    Algorithm (canon b2c-catalog-flows.md#b2c-4-similar-products):
+      1. Fetch the target product from B2B to get its category_id and validate existence.
+         Returns None if product is unknown / deleted / blocked (→ 404 to caller).
+      2. Fetch visible products in that category from B2B (limit+1 to have room after
+         excluding self).
+      3. Filter out the target product from the result.
+      4. Return up to `limit` items as CatalogProductCard list.
+
+    Fallback to parent category (canon §4, step 3) is NOT implemented in this MVP —
+    B2C has no category-hierarchy endpoint to resolve parent_id. Tracked as tech-debt;
+    add once GET /api/v1/catalog/categories/tree is consumed.
+
+    ADR (similar products algorithm) — three approaches considered:
+      (a) Random sample (ORDER BY RANDOM()) — chosen. Zero config, each page-load
+          shows variety, no caching needed. Downside: not reproducible across reloads.
+      (b) Characteristic-match score (COUNT of shared attrs) — better relevance, but
+          requires B2B to expose the scoring logic (new endpoint) and full
+          characteristics per item.
+      (c) Pre-computed recommendation cache — best quality, but adds ML infra and
+          cache invalidation complexity. Out of scope for MVP.
+    Criteria: (1) implementation complexity — approach (a) is a single B2B query;
+    (2) result variety — random keeps the block fresh on every reload without extra infra.
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+    """
+    # Step 1 — verify product exists and get its category_id
+    headers = {"X-Service-Key": service_key}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        product_resp = await client.get(
+            f"{b2b_base_url}/api/v1/products/{product_id}",
+            headers=headers,
+        )
+
+    if product_resp.status_code == 404:
+        return None   # caller will return 404
+    product_resp.raise_for_status()
+
+    product_data = product_resp.json()
+    # Deleted / non-MODERATED → treat as not found
+    if product_data.get("deleted") or product_data.get("status") != "MODERATED":
+        return None
+
+    category_id: str = product_data.get("category_id", "")
+
+    # Step 2 — fetch visible products in the same category (request one extra)
+    params: dict[str, Any] = {
+        "limit": limit + 1,
+        "offset": 0,
+        "sort": "date_desc",
+    }
+    if category_id:
+        params["category"] = category_id
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        catalog_resp = await client.get(
+            f"{b2b_base_url}/api/v1/public/products",
+            params=params,
+            headers=headers,
+        )
+    catalog_resp.raise_for_status()
+
+    items = catalog_resp.json().get("items", [])
+
+    # Step 3 — exclude current product
+    similar = [i for i in items if i["id"] != str(product_id)]
+
+    # Step 4 — cap at limit and convert
+    return [_b2b_item_to_card(i) for i in similar[:limit]]
+
+
+CatalogService.get_similar = staticmethod(_get_similar)  # type: ignore[attr-defined]
