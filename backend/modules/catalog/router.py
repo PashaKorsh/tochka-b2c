@@ -22,12 +22,13 @@ from typing import Optional
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Path, Query, Request
 from fastapi.responses import JSONResponse
 
 from backend import config
 from backend.modules.catalog.schemas import (
     ALLOWED_SORT_VALUES,
+    CatalogProductDetail,
     ErrorResponse,
     FacetsResponse,
     PaginatedCatalogProducts,
@@ -302,3 +303,78 @@ async def get_catalog_facets(
         return _upstream_error(f"B2B returned {exc.response.status_code}")
 
     return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/catalog/products/{product_id}
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/catalog/products/{product_id}",
+    response_model=CatalogProductDetail,
+    responses={
+        200: {"description": "Карточка товара"},
+        404: {"model": ErrorResponse, "description": "Товар не найден / заблокирован / удалён"},
+        502: {"model": ErrorResponse, "description": "B2B недоступен"},
+    },
+    summary="Карточка товара (US-B2C-03)",
+    description="""
+    Возвращает полную публичную карточку товара: описание, изображения,
+    характеристики, список SKU с ценами и остатками.
+
+    Прокси к B2B GET /api/v1/products/{id} (X-Service-Key).
+
+    Поля cost_price и reserved_quantity ВСЕГДА отсутствуют в ответе —
+    это внутренние данные продавца (ADR: отдельная Pydantic-схема на
+    каждое представление, поля не передаются даже как null).
+
+    Ценообразование (canon b2c-catalog-flows.md#b2c-3-product-card):
+      price     = фактическая цена (base - discount), копейки
+      old_price = base price, когда discount > 0 (зачёркнутая), иначе null
+
+    Видимость:
+      - deleted=true или status != MODERATED → 404
+      - SKU с нулевым остатком показываются с in_stock=false
+      - Товар с has_stock=false (все SKU нулевые) всё равно отдаётся 200
+
+    Ошибки:
+      404 NOT_FOUND    — товар отсутствует, удалён или заблокирован
+      502 UPSTREAM_UNAVAILABLE — B2B недоступен
+    """,
+)
+async def get_catalog_product(
+    product_id: UUID = Path(..., description="UUID товара"),
+) -> CatalogProductDetail | JSONResponse:
+    """
+    GET /api/v1/catalog/products/{product_id} — product card (US-B2C-03).
+
+    Canon test scenarios:
+    - product_card_returns_full_data_with_skus
+    - cost_price_absent_in_response
+    - blocked_product_returns_404
+    - sku_without_stock_is_shown_as_unavailable
+    - b2b_unavailable_returns_502
+    """
+    try:
+        detail = await CatalogService.get_product(
+            b2b_base_url=config.B2B_BASE_URL,
+            service_key=config.B2C_TO_B2B_KEY,
+            product_id=product_id,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        return _upstream_error(f"B2B service unavailable: {exc}")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return JSONResponse(
+                status_code=404,
+                content={"code": "NOT_FOUND", "message": "Product not found"},
+            )
+        return _upstream_error(f"B2B returned {exc.response.status_code}")
+
+    if detail is None:
+        return JSONResponse(
+            status_code=404,
+            content={"code": "NOT_FOUND", "message": "Product not found"},
+        )
+
+    return detail

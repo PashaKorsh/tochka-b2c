@@ -4,6 +4,8 @@ B2C Catalog Pydantic schemas — aligned with b2c/openapi.yaml.
 Key types:
   CatalogProductCard       — item in the product listing (required: id, name, min_price, has_stock, images).
   PaginatedCatalogProducts — paged response for GET /api/v1/catalog/products.
+  CatalogSkuResponse       — SKU in the product detail (NO cost_price / reserved_quantity).
+  CatalogProductDetail     — full product card for GET /api/v1/catalog/products/{id}.
   FacetValue               — single bucket in a facet (value + count).
   Facet                    — named group of facet buckets.
   FacetsResponse           — response for GET /api/v1/catalog/facets.
@@ -11,6 +13,12 @@ Key types:
 
 Sort enum (spec b2c/openapi.yaml#/paths/~1api~1v1~1catalog~1products/get):
   price_asc | price_desc | popularity | new
+
+Security note — FORBIDDEN fields in any buyer-facing response:
+  cost_price, reserved_quantity — internal seller data; must NEVER appear in B2C output.
+  ADR: explicit Pydantic schema per representation (seller vs buyer) rather than runtime
+  field-exclusion: a new field added to a shared model cannot accidentally leak because
+  only the whitelisted schema fields are serialised.
 """
 from typing import Optional, List
 from uuid import UUID
@@ -70,6 +78,74 @@ class PaginatedCatalogProducts(BaseModel):
     total_count: int
     limit: int
     offset: int
+
+
+# ────────────────────────── Product detail ──────────────────────────
+
+class CharacteristicRef(BaseModel):
+    """Characteristic name/value pair — same shape as B2B CharacteristicResponse."""
+    name: str
+    value: str
+
+
+class CatalogSkuImageRef(BaseModel):
+    """Image attached to a SKU."""
+    id: UUID
+    url: str
+    ordering: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class CatalogSkuResponse(BaseModel):
+    """
+    spec b2c/openapi.yaml#CatalogSku — buyer-safe SKU representation.
+    required: [id, price, available_quantity]
+
+    Security: MUST NOT contain cost_price or reserved_quantity.
+    These fields are never populated from B2B's ProductPublicResponse / SKUPublicResponse
+    (B2B already strips them in service-key mode), and are not declared here, so they
+    cannot accidentally appear in the serialised JSON.
+
+    Price convention (canon b2c-catalog-flows.md#b2c-3-product-card):
+      price    = effective selling price = B2B.price - B2B.discount
+      old_price = B2B.price when discount > 0, else None (strikethrough display)
+    """
+    id: UUID
+    name: Optional[str] = None
+    sku_code: Optional[str] = None   # B2B article field
+    price: int                        # effective price (after discount), kopecks
+    old_price: Optional[int] = None  # original price when discount > 0
+    available_quantity: int           # B2B active_quantity (stock - reserved)
+    in_stock: bool                    # computed: available_quantity > 0
+    images: List[CatalogSkuImageRef] = []
+    characteristics: List[CharacteristicRef] = []
+
+
+class CatalogProductDetail(BaseModel):
+    """
+    spec b2c/openapi.yaml#CatalogProductDetail — full public product card.
+    allOf: CatalogProductCard + {description, skus}
+
+    Returned by GET /api/v1/catalog/products/{product_id} (US-B2C-03).
+    """
+    # CatalogProductCard fields
+    id: UUID
+    name: str
+    slug: Optional[str] = None
+    category_id: Optional[UUID] = None
+    min_price: int
+    old_price: Optional[int] = None
+    has_stock: bool
+    rating: Optional[float] = None
+    reviews_count: Optional[int] = None
+    images: List[ImageRef]
+    seller_id: Optional[UUID] = None
+    # Detail-only fields
+    description: str
+    characteristics: List[CharacteristicRef] = []
+    skus: List[CatalogSkuResponse]
 
 
 # ────────────────────────── Facets ──────────────────────────
