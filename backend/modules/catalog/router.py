@@ -2,12 +2,15 @@
 Catalog router — B2C proxy for the public NeoMarket product listing.
 
 Paths (spec b2c/openapi.yaml):
-  GET /api/v1/catalog/products  — filtered/sorted product listing
+  GET /api/v1/catalog/products  — filtered/sorted product listing with full-text search
   GET /api/v1/catalog/facets    — facet counts for current filter set
 
 Contract notes (CLAUDE.md §1 checklists):
   • sort enum strictly from spec: [price_asc, price_desc, popularity, new].
     Invalid value → 400 INVALID_REQUEST listing allowed values.
+  • Search param `q` (spec field): min 3 chars, max 200 chars (spec maxLength).
+    Violations → 400 INVALID_REQUEST (not 422) — canon b2c-catalog-flows.md#b2c-2-search.
+    Special chars (%, _, ') are safe — B2B escapes them before SQL LIKE.
   • Filter params use deepObject style in spec (?filter[key]=val). FastAPI doesn't
     parse deepObject natively, so we parse them from request.query_params.
   • B2B unavailable → 502 {"code":"UPSTREAM_UNAVAILABLE","message":"..."}.
@@ -38,6 +41,43 @@ router = APIRouter(prefix="/api/v1", tags=["Catalog"])
 # Helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+_SEARCH_MIN_LEN = 3
+_SEARCH_MAX_LEN = 200  # spec b2c/openapi.yaml q.maxLength
+
+
+def _validate_q(q: Optional[str]) -> Optional[JSONResponse]:
+    """
+    Validate the search query string `q`.
+
+    Returns a 400 JSONResponse if q violates length constraints,
+    otherwise returns None (caller continues normally).
+
+    canon b2c-catalog-flows.md#b2c-2-search edge cases:
+      < 3 chars → 400 INVALID_REQUEST "Search query must be at least 3 characters"
+      > 200 chars (spec maxLength) → 400 INVALID_REQUEST
+    """
+    if q is None:
+        return None
+    stripped = q.strip()
+    if len(stripped) < _SEARCH_MIN_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": "Search query must be at least 3 characters",
+            },
+        )
+    if len(q) > _SEARCH_MAX_LEN:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "INVALID_REQUEST",
+                "message": f"Search query must be at most {_SEARCH_MAX_LEN} characters",
+            },
+        )
+    return None
+
+
 def _upstream_error(detail: str = "B2B service unavailable") -> JSONResponse:
     return JSONResponse(
         status_code=502,
@@ -67,39 +107,53 @@ def _parse_deep_object_filters(request: Request) -> dict:
     response_model=PaginatedCatalogProducts,
     responses={
         200: {"description": "Страница товаров"},
-        400: {"model": ErrorResponse, "description": "Невалидный параметр (sort)"},
+        400: {"model": ErrorResponse, "description": "Невалидный параметр (sort / q)"},
         502: {"model": ErrorResponse, "description": "B2B недоступен"},
     },
-    summary="Публичный листинг товаров с фильтрами (US-B2C-01)",
+    summary="Публичный листинг товаров с фильтрами и поиском (US-B2C-01/02)",
     description="""
     Прокси к B2B-каталогу (GET /api/v1/public/products) через X-Service-Key.
     Видимость: только MODERATED товары с active_quantity>0 — фильтрует B2B.
 
-    Фильтры передаются в deepObject-стиле:
-    `?filter[price_min]=10000&filter[price_max]=50000&filter[category_id]=<uuid>`
+    Поиск (US-B2C-02):
+    - `?q=текст` — полнотекстовый поиск по title/description (выполняется B2B).
+    - Минимум 3 символа, максимум 200 (spec b2c/openapi.yaml).
+    - Спецсимволы (%, _, ') безопасны — B2B экранирует перед SQL LIKE.
+    - Пустой результат → 200 с items:[].
 
-    Сортировка (spec b2c/openapi.yaml): price_asc | price_desc | popularity | new
+    Фильтры (deepObject): `?filter[price_min]=...&filter[category_id]=<uuid>`
+    Сортировка: price_asc | price_desc | popularity | new
 
     Ошибки:
-    - невалидный sort → 400 INVALID_REQUEST с перечислением допустимых (CLAUDE.md §5)
-    - B2B недоступен → 502 UPSTREAM_UNAVAILABLE (CLAUDE.md §5)
+    - q < 3 символов → 400 INVALID_REQUEST
+    - невалидный sort → 400 INVALID_REQUEST с перечислением допустимых
+    - B2B недоступен → 502 UPSTREAM_UNAVAILABLE
     """,
 )
 async def list_catalog_products(
     request: Request,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    q: Optional[str] = Query(None, max_length=200),
+    q: Optional[str] = Query(None, description="Полнотекстовый поиск (мин. 3 символа)"),
     sort: str = Query("popularity"),
 ) -> PaginatedCatalogProducts | JSONResponse:
     """
-    GET /api/v1/catalog/products — public catalog (US-B2C-01).
+    GET /api/v1/catalog/products — public catalog + search (US-B2C-01/02).
 
     Canon test scenarios:
     - catalog_returns_filtered_sorted_products
+    - search_returns_matching_products
+    - short_query_returns_400
+    - special_chars_do_not_break_query
+    - empty_results_returns_200
     - invalid_sort_returns_400
     - b2b_unavailable_returns_502
     """
+    # Validate search query length (canon b2c-catalog-flows.md#b2c-2-search)
+    q_err = _validate_q(q)
+    if q_err is not None:
+        return q_err
+
     # Validate sort
     if sort not in ALLOWED_SORT_VALUES:
         return JSONResponse(
@@ -191,15 +245,18 @@ async def list_catalog_products(
 )
 async def get_catalog_facets(
     request: Request,
-    q: Optional[str] = Query(None, max_length=200),
+    q: Optional[str] = Query(None, description="Полнотекстовый поиск (мин. 3 символа)"),
 ) -> FacetsResponse | JSONResponse:
     """
-    GET /api/v1/catalog/facets — facets for current filter set (US-B2C-01).
+    GET /api/v1/catalog/facets — facets for current filter set (US-B2C-01/02).
 
     Canon test scenarios:
     - facets_return_counts_per_filter_value
     - b2b_unavailable_returns_502
     """
+    q_err = _validate_q(q)
+    if q_err is not None:
+        return q_err
     filters = _parse_deep_object_filters(request)
     filter_category_id: Optional[UUID] = None
     filter_price_min: Optional[int] = None
