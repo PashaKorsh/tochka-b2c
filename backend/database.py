@@ -13,8 +13,11 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.orm import DeclarativeBase
 
 DATABASE_URL: str = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5433/tochkab2c",
+    "TEST_DATABASE_URL",  # test env takes priority
+    os.getenv(
+        "DATABASE_URL",
+        "postgresql+asyncpg://postgres:postgres@localhost:5433/tochkab2c",
+    ),
 )
 
 engine: AsyncEngine = create_async_engine(DATABASE_URL, echo=False)
@@ -31,6 +34,8 @@ class Base(DeclarativeBase):
 
 
 async def create_tables() -> None:
+    # Import all models so Base.metadata knows about them before create_all
+    from backend.modules.favorites import models as _fav_models  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
