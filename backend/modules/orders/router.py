@@ -1,5 +1,6 @@
 """
-Orders router — US-B2C-09 (checkout) + US-B2C-10 (view) + US-B2C-11 (cancel).
+Orders router — US-B2C-09 (checkout) + US-B2C-10 (view) + US-B2C-11 (cancel)
+              + US-B2C-13 (deliver / fulfill trigger).
 
 Spec: b2c/openapi.yaml (neomarket-protocols)
   POST /api/v1/orders
@@ -24,12 +25,20 @@ Spec: b2c/openapi.yaml (neomarket-protocols)
     404:    Error {code: ORDER_NOT_FOUND}   (also for wrong-user IDOR)
     409:    Error {code: CANCEL_NOT_ALLOWED, details: {current_status}}
 
-Auth: Bearer JWT required on all endpoints. buyer_id comes ONLY from JWT claims.
+  POST /api/v1/orders/{order_id}/deliver   (US-B2C-13, admin/service endpoint)
+    Header: X-Service-Key (required)
+    200:    OrderResponse (status=DELIVERED)
+    404:    Error {code: ORDER_NOT_FOUND}
+    409:    Error {code: DELIVER_NOT_ALLOWED, details: {current_status}}
+
+Auth: Bearer JWT required on buyer-facing endpoints.
+      X-Service-Key required on admin/service endpoints (deliver).
 
 IDOR rule (canon b2c-orders-flows.md#b2c-10-view-orders, #b2c-11-cancel-order):
   Wrong-user order -> 404, never 403.
   Returning 403 would reveal that the order exists, enabling UUID enumeration.
 """
+import os
 from typing import Optional
 from uuid import UUID
 
@@ -49,10 +58,27 @@ from backend.modules.orders.schemas import (
 )
 from backend.modules.orders.service import OrdersService
 
+_ADMIN_SERVICE_KEY = os.getenv("B2C_ADMIN_KEY", "dev-service-key")
+
 
 class CancelRequest(BaseModel):
     """Optional body for POST /api/v1/orders/{id}/cancel."""
     reason: Optional[str] = None
+
+
+async def _require_admin_key(
+    x_service_key: Optional[str] = Header(None, alias="X-Service-Key"),
+) -> None:
+    """Dependency: validate X-Service-Key for internal/admin endpoints."""
+    if x_service_key is None or x_service_key != _ADMIN_SERVICE_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "UNAUTHORIZED",
+                "message": "Missing or invalid X-Service-Key",
+            },
+        )
+
 
 router = APIRouter(prefix="/api/v1", tags=["Orders"])
 
@@ -276,6 +302,69 @@ async def cancel_order(
                 detail={
                     "code": "CANCEL_NOT_ALLOWED",
                     "message": f"Cannot cancel order in status {current_status}",
+                    "details": {"current_status": current_status},
+                },
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_REQUEST", "message": msg},
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# POST /api/v1/orders/{order_id}/deliver  (US-B2C-13)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/orders/{order_id}/deliver",
+    response_model=OrderResponse,
+    summary="Mark order DELIVERED and trigger B2B inventory/fulfill (admin)",
+)
+async def deliver_order(
+    order_id: UUID,
+    _: None = Depends(_require_admin_key),
+    db: AsyncSession = Depends(get_db),
+) -> OrderResponse:
+    """
+    Admin/service endpoint: called by the logistics system when delivery is confirmed.
+
+    Transitions the order to DELIVERED and calls POST /api/v1/inventory/fulfill in B2B
+    to deduct reserved_quantity from the warehouse.
+
+    Idempotent: if the order is already DELIVERED and fulfill was acknowledged,
+    returns the order immediately without calling B2B again.
+
+    On B2B fulfill failure: order stays DELIVERED, error is logged.
+    Retry eligibility: orders WHERE status='DELIVERED' AND fulfill_completed_at IS NULL.
+    A Celery worker should pick these up (scaffold — not implemented in first iteration).
+
+    Auth: X-Service-Key (not buyer JWT — this is an internal/admin operation).
+
+    Spec: b2c/openapi.yaml POST /api/v1/orders/{order_id}/deliver
+    Canon: b2c-orders-flows.md#b2c-13-fulfill
+    """
+    try:
+        return await OrdersService.deliver_order(
+            db,
+            order_id=order_id,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg == "ORDER_NOT_FOUND":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ORDER_NOT_FOUND",
+                    "message": "Order not found",
+                },
+            )
+        if msg.startswith("DELIVER_NOT_ALLOWED:"):
+            current_status = msg.split(":", 1)[1]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "DELIVER_NOT_ALLOWED",
+                    "message": f"Cannot deliver order in status {current_status}",
                     "details": {"current_status": current_status},
                 },
             )

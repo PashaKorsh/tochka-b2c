@@ -1,10 +1,13 @@
 """
-OrdersService — checkout + read + cancel flows (US-B2C-09, US-B2C-10, US-B2C-11).
+OrdersService — checkout + read + cancel + deliver flows
+(US-B2C-09, US-B2C-10, US-B2C-11, US-B2C-13).
 
 Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders,
-       b2c-orders-flows.md#b2c-11-cancel-order
+       b2c-orders-flows.md#b2c-11-cancel-order,
+       b2c-orders-flows.md#b2c-13-fulfill
 Spec:  b2c/openapi.yaml — POST /api/v1/orders, GET /api/v1/orders,
-       GET /api/v1/orders/{id}, POST /api/v1/orders/{id}/cancel
+       GET /api/v1/orders/{id}, POST /api/v1/orders/{id}/cancel,
+       POST /api/v1/orders/{id}/deliver
 
 Architecture:
   Idempotency: UNIQUE constraint on orders.idempotency_key.
@@ -113,6 +116,30 @@ async def _reserve(
             pass
         raise ValueError(f"RESERVE_FAILED:{resp.status_code}:{body}")
     # 200 / 201 / 204 — all fine
+
+
+async def _fulfill(
+    order_id: UUID,
+    items: list[dict[str, Any]],
+    b2b_base_url: str,
+    service_key: str,
+) -> None:
+    """
+    POST /api/v1/inventory/fulfill — inform B2B that the order was delivered.
+    B2B deducts reserved_quantity; idempotent by order_id on the B2B side.
+    Raises httpx.ConnectError / TimeoutException on network failure
+    (caller logs and proceeds — order stays DELIVERED; retry scaffold via Celery TBD).
+    """
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{b2b_base_url}/api/v1/inventory/fulfill",
+            json={
+                "order_id": str(order_id),
+                "items": items,
+            },
+            headers={"X-Service-Key": service_key},
+        )
+    resp.raise_for_status()
 
 
 async def _unreserve(
@@ -501,5 +528,106 @@ class OrdersService:
         order.status = new_status
         order.updated_at = datetime.now(timezone.utc)
         await db.commit()
+
+        return await _load_order(db, order)
+
+    @staticmethod
+    async def deliver_order(
+        db: AsyncSession,
+        *,
+        order_id: UUID,
+        b2b_base_url: str = B2B_BASE_URL,
+        service_key: str = B2C_TO_B2B_KEY,
+    ) -> OrderResponse:
+        """
+        Mark an order as DELIVERED and trigger B2B inventory/fulfill.
+
+        Called by an internal/admin endpoint (X-Service-Key auth), not by the buyer.
+        This is the US-B2C-13 trigger — the equivalent of a post_save signal in Django.
+
+        Canon flow (b2c-orders-flows.md#b2c-13-fulfill):
+          1. Fetch order by id (no buyer_id guard — this is an admin operation).
+          2. Check order is not already terminal (CANCELLED, CANCEL_PENDING) → 409.
+          3. If already DELIVERED and fulfill_completed_at is set → idempotent return (skip B2B).
+          4. Transition status to DELIVERED, persist.
+          5. POST /api/v1/inventory/fulfill {order_id, items}.
+          6. On B2B success → set fulfill_completed_at = now().
+          7. On B2B network failure → log error, fulfill_completed_at remains NULL
+             (retry scaffold: a Celery worker should pick up rows WHERE status=DELIVERED
+              AND fulfill_completed_at IS NULL). Order stays DELIVERED — the buyer gets
+              their goods regardless of a temporary B2B outage.
+
+        Idempotency (DoD test repeated_fulfill_idempotent):
+          If fulfill_completed_at is already set, skip the B2B call and return the order.
+          This prevents double-fulfill when deliver is called twice with B2B succeeding
+          on the first call. Uses fulfill_completed_at as the single-truth flag.
+
+        ADR — trigger mechanism options:
+          A) Admin endpoint POST /orders/{id}/deliver + X-Service-Key (chosen):
+             Clean separation: delivery confirmation arrives from a logistics/admin service.
+             No background thread: trigger is synchronous in request context, fully testable
+             by mocking httpx without any Celery/worker infrastructure.
+             Double-trigger risk: mitigated by fulfill_completed_at column checked before
+             calling B2B; second call is a no-op if first succeeded.
+          B) FastAPI startup background task / APScheduler polling:
+             Polls for DELIVERING orders older than N minutes. Harder to test (timing-based).
+             Risk: poll interval adds latency; no natural idempotency boundary.
+          C) SQLAlchemy event.listen on attribute_set / after_flush:
+             Couples persistence to HTTP side-effect. Hard to mock in tests without
+             monkeypatching module-level globals. Breaks unit test isolation.
+          D) Outbox pattern (recommended for production):
+             Persist OutboxEvent row in the same transaction; separate worker reads & sends.
+             Zero double-trigger risk, retryable. Out of scope for first iteration.
+
+          Criteria: testability without admin UI, low double-trigger risk, no Celery infra now.
+          Winner: Option A (endpoint), with Outbox as the stated next step.
+
+        Raises:
+          ValueError("ORDER_NOT_FOUND") → 404
+          ValueError("DELIVER_NOT_ALLOWED:{status}") → 409
+        """
+        # Step 1 — fetch order (admin — no buyer_id filter)
+        result = await db.execute(select(Order).where(Order.id == order_id))
+        order = result.scalar_one_or_none()
+        if order is None:
+            raise ValueError("ORDER_NOT_FOUND")
+
+        # Step 2 — terminal status guard (can't deliver a cancelled order)
+        _TERMINAL = {"CANCELLED", "CANCEL_PENDING"}
+        if order.status in _TERMINAL:
+            raise ValueError(f"DELIVER_NOT_ALLOWED:{order.status}")
+
+        # Step 3 — idempotency: already delivered AND fulfill acknowledged → skip B2B
+        if order.status == "DELIVERED" and order.fulfill_completed_at is not None:
+            return await _load_order(db, order)
+
+        # Step 4 — load items for fulfill payload
+        items_result = await db.execute(
+            select(OrderItem).where(OrderItem.order_id == order.id)
+        )
+        order_items = items_result.scalars().all()
+        fulfill_items = [
+            {"sku_id": str(it.sku_id), "quantity": it.quantity}
+            for it in order_items
+        ]
+
+        # Step 5 — persist DELIVERED status
+        order.status = "DELIVERED"
+        order.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+
+        # Step 6 — call B2B fulfill (fire-and-forget with error logging)
+        try:
+            await _fulfill(order_id, fulfill_items, b2b_base_url, service_key)
+            order.fulfill_completed_at = datetime.now(timezone.utc)
+            await db.commit()
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+            # Scaffold: order stays DELIVERED; retry via Celery worker TBD.
+            # Worker query: SELECT * FROM orders WHERE status='DELIVERED' AND fulfill_completed_at IS NULL
+            logger.warning(
+                "B2B fulfill failed for order %s — fulfill_completed_at not set, retry pending: %s",
+                order_id,
+                exc,
+            )
 
         return await _load_order(db, order)
