@@ -1,32 +1,46 @@
 """
-Orders router — US-B2C-09.
+Orders router — US-B2C-09 (checkout) + US-B2C-10 (view orders).
 
 Spec: b2c/openapi.yaml (neomarket-protocols)
   POST /api/v1/orders
     Header: Idempotency-Key (required, UUID)
     Body:   OrderCreateRequest
     201:    OrderResponse (new order created)
-    200:    OrderResponse (idempotency replay — same key, same body)
-    409:    Error {code: RESERVE_FAILED, message: ...}
-    503:    Error {code: UPSTREAM_UNAVAILABLE, message: ...}
+    200:    OrderResponse (idempotency replay)
+    409:    Error {code: RESERVE_FAILED}
+    503:    Error {code: UPSTREAM_UNAVAILABLE}
 
-Auth: Bearer JWT required (buyer_id from token sub claim).
+  GET /api/v1/orders
+    Query:  limit, offset, status (optional filter)
+    200:    PaginatedOrders {items, total_count, limit, offset}
+    401:    Unauthorized
 
-Contract resolution notes:
-  - Idempotency-Key is an HTTP HEADER (spec), not a body field (canon).
-  - Status immediately PAID (mock payment — no real gateway in DoD).
-  - Reserve via POST /api/v1/inventory/reserve (spec path, not /reserve).
+  GET /api/v1/orders/{order_id}
+    200:    OrderResponse
+    404:    Error {code: ORDER_NOT_FOUND}  <- also returned for wrong-user (IDOR)
+
+Auth: Bearer JWT required on all endpoints. buyer_id comes ONLY from JWT claims.
+
+IDOR rule (canon b2c-orders-flows.md#b2c-10-view-orders):
+  Wrong-user order -> 404, never 403.
+  Returning 403 would reveal that the order exists, enabling UUID enumeration.
 """
+from typing import Optional
 from uuid import UUID
 
 import httpx
-from fastapi import APIRouter, Depends, Header, HTTPException, Response
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user_id
 from backend.database import get_db
-from backend.modules.orders.schemas import OrderCreateRequest, OrderResponse
+from backend.modules.orders.schemas import (
+    OrderCreateRequest,
+    OrderResponse,
+    OrderStatus,
+    PaginatedOrdersResponse,
+)
 from backend.modules.orders.service import OrdersService
 
 router = APIRouter(prefix="/api/v1", tags=["Orders"])
@@ -41,6 +55,10 @@ def _upstream_error(exc: Exception) -> HTTPException:
         },
     )
 
+
+# ──────────────────────────────────────────────────────────────────────────────
+# POST /api/v1/orders  (US-B2C-09)
+# ──────────────────────────────────────────────────────────────────────────────
 
 @router.post(
     "/orders",
@@ -105,3 +123,88 @@ async def create_order(
         content=order_resp.model_dump(mode="json"),
         status_code=status_code,
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/orders  (US-B2C-10)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/orders",
+    response_model=PaginatedOrdersResponse,
+    summary="List buyer's own orders with pagination",
+)
+async def list_orders(
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    status: Optional[str] = Query(
+        default=None,
+        description="Filter by order status",
+        enum=[s.value for s in OrderStatus],
+    ),
+    db: AsyncSession = Depends(get_db),
+    buyer_id: UUID = Depends(get_current_user_id),
+) -> PaginatedOrdersResponse:
+    """
+    Return paginated history of orders belonging to the authenticated buyer.
+
+    buyer_id is extracted from the JWT — never from query params (IDOR-safe).
+    Sorted by created_at DESC (most recent first).
+
+    Spec: b2c/openapi.yaml GET /api/v1/orders -> PaginatedOrders
+    Canon: b2c-orders-flows.md#b2c-10-view-orders
+    """
+    return await OrdersService.list_orders(
+        db,
+        buyer_id=buyer_id,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GET /api/v1/orders/{order_id}  (US-B2C-10)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/orders/{order_id}",
+    response_model=OrderResponse,
+    summary="Order detail with fixed prices",
+)
+async def get_order(
+    order_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    buyer_id: UUID = Depends(get_current_user_id),
+) -> OrderResponse:
+    """
+    Return full order detail for the authenticated buyer.
+
+    Prices come from OrderItem.unit_price (fixed at checkout) — not from B2B.
+    A seller changing a SKU price after checkout does NOT affect this response.
+
+    IDOR: if the order exists but belongs to a different buyer, returns 404
+    (not 403) — preventing an attacker from inferring order existence by UUID.
+
+    Spec: b2c/openapi.yaml GET /api/v1/orders/{order_id}
+    Canon: b2c-orders-flows.md#b2c-10-view-orders §Authorization
+    """
+    try:
+        return await OrdersService.get_order(
+            db,
+            order_id=order_id,
+            buyer_id=buyer_id,
+        )
+    except ValueError as exc:
+        if str(exc) == "ORDER_NOT_FOUND":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ORDER_NOT_FOUND",
+                    "message": "Order not found",
+                },
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_REQUEST", "message": str(exc)},
+        )
