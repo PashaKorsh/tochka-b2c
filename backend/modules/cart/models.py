@@ -1,8 +1,9 @@
 """
-SQLAlchemy model for the cart_items table (US-B2C-08).
+SQLAlchemy model for the cart_items table (US-B2C-08 / US-B2C-12).
 
 Schema (canon b2c-cart-flows.md#b2c-8-cart):
-  cart_items (id, user_id, session_id, sku_id, product_id, quantity, created_at, updated_at)
+  cart_items (id, user_id, session_id, sku_id, product_id, quantity,
+              unavailable_reason, created_at, updated_at)
 
 Identity rules:
   - Authenticated users: user_id from JWT claims (NOT NULL), session_id = NULL.
@@ -26,6 +27,7 @@ from sqlalchemy import (
     Index,
     Integer,
     String,
+    Text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 
@@ -41,6 +43,9 @@ class CartItem(Base):
     sku_id = Column(PG_UUID(as_uuid=True), nullable=False)
     product_id = Column(PG_UUID(as_uuid=True), nullable=False)
     quantity = Column(Integer, nullable=False)
+    # Set by US-B2C-12 (handle B2B events): PRODUCT_BLOCKED, PRODUCT_HARD_BLOCKED,
+    # PRODUCT_DELETED, OUT_OF_STOCK. NULL = item is available.
+    unavailable_reason = Column(Text, nullable=True, default=None)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,

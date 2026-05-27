@@ -17,6 +17,7 @@ from backend.modules.cart.router import router as cart_router
 from backend.modules.banners.router import router as banners_router
 from backend.modules.collections.router import router as collections_router
 from backend.modules.orders.router import router as orders_router
+from backend.modules.events.router import router as events_router
 
 app = FastAPI(
     title="NeoMarket B2C API",
@@ -88,6 +89,7 @@ app.include_router(cart_router)
 app.include_router(banners_router)
 app.include_router(collections_router)
 app.include_router(orders_router)
+app.include_router(events_router)
 
 
 # ─────────────────────── Health ───────────────────────
