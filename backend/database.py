@@ -41,6 +41,7 @@ async def create_tables() -> None:
     from backend.modules.banners import models as _banner_models  # noqa: F401
     from backend.modules.collections import models as _col_models  # noqa: F401
     from backend.modules.orders import models as _order_models  # noqa: F401
+    from backend.modules.events import models as _event_models  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
