@@ -37,6 +37,7 @@ async def create_tables() -> None:
     # Import all models so Base.metadata knows about them before create_all
     from backend.modules.favorites import models as _fav_models  # noqa: F401
     from backend.modules.subscriptions import models as _sub_models  # noqa: F401
+    from backend.modules.cart import models as _cart_models  # noqa: F401
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 

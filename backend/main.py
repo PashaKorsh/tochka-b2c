@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from backend.modules.catalog.router import router as catalog_router
 from backend.modules.favorites.router import router as favorites_router
 from backend.modules.subscriptions.router import router as subscriptions_router
+from backend.modules.cart.router import router as cart_router
 
 app = FastAPI(
     title="NeoMarket B2C API",
@@ -80,6 +81,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 app.include_router(catalog_router)
 app.include_router(favorites_router)
 app.include_router(subscriptions_router)
+app.include_router(cart_router)
 
 
 # ─────────────────────── Health ───────────────────────
