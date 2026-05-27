@@ -22,6 +22,7 @@ from sqlalchemy.pool import NullPool
 from backend.modules.favorites import models as _fav_models  # noqa: F401 — register Favorite with Base
 from backend.modules.subscriptions import models as _sub_models  # noqa: F401 — register ProductSubscription with Base
 from backend.modules.cart import models as _cart_models  # noqa: F401 — register CartItem with Base
+from backend.modules.banners import models as _banner_models  # noqa: F401 — register Banner/BannerEvent with Base
 from backend.database import Base, get_db
 
 _TEST_DB_URL = os.getenv(
