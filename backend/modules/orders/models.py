@@ -1,5 +1,5 @@
 """
-Order and OrderItem models — US-B2C-09.
+Order and OrderItem models — US-B2C-09 / US-B2C-10.
 
 Architecture decisions:
   - idempotency_key is a UNIQUE column on orders — DB enforces race-safety atomically.
@@ -9,10 +9,13 @@ Architecture decisions:
   - unit_price / line_total are integer cents (snapshot at checkout time).
   - delivery_address is a TEXT snapshot (freeform) — no FK to an address table
     because B2C does not have an address registry yet.
+    Spec deviation: spec.OrderResponse.address is AddressResponse (structured object);
+    current impl keeps it as a string until the address-book service is built.
   - payment_method_id stored as UUID for future integration; payment is mocked.
+  - updated_at tracks the last status transition (PAID→ASSEMBLING→…).
 
-Canon: b2c-cart-flows.md#b2c-09-checkout
-Spec:  b2c/openapi.yaml — OrderResponse, OrderItem
+Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders
+Spec:  b2c/openapi.yaml — OrderResponse, OrderItem, PaginatedOrders
 """
 import uuid
 from datetime import datetime, timezone
@@ -42,6 +45,12 @@ class Order(Base):
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
     )
 
     __table_args__ = (
