@@ -1,5 +1,5 @@
 """
-Order and OrderItem models — US-B2C-09 / US-B2C-10.
+Order and OrderItem models — US-B2C-09 / US-B2C-10 / US-B2C-13.
 
 Architecture decisions:
   - idempotency_key is a UNIQUE column on orders — DB enforces race-safety atomically.
@@ -13,8 +13,12 @@ Architecture decisions:
     current impl keeps it as a string until the address-book service is built.
   - payment_method_id stored as UUID for future integration; payment is mocked.
   - updated_at tracks the last status transition (PAID→ASSEMBLING→…).
+  - fulfill_completed_at (US-B2C-13): set when B2B POST /inventory/fulfill succeeds.
+    NULL = fulfill not yet sent or previously failed (retry eligible).
+    Non-NULL = fulfill acknowledged by B2B — skip on repeated deliver calls.
 
-Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders
+Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders,
+       b2c-orders-flows.md#b2c-13-fulfill
 Spec:  b2c/openapi.yaml — OrderResponse, OrderItem, PaginatedOrders
 """
 import uuid
@@ -51,6 +55,13 @@ class Order(Base):
         nullable=True,
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
+    )
+    # US-B2C-13: set when B2B inventory/fulfill is successfully acknowledged.
+    # NULL = not yet sent or last attempt failed (eligible for retry).
+    fulfill_completed_at = Column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
     )
 
     __table_args__ = (
