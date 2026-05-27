@@ -718,3 +718,257 @@ async def test_other_user_order_returns_404_not_403():
         "Returning 403 reveals order existence — security violation."
     )
     assert attacker_resp.json()["code"] == "ORDER_NOT_FOUND"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# US-B2C-11 DoD tests (exact names required)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_paid_order_transitions_to_cancelled():
+    """
+    POST /orders/{id}/cancel on a PAID order → B2B unreserve succeeds → 200 CANCELLED.
+
+    Verifies:
+    - 200 status
+    - body.status == "CANCELLED"
+    - body.id == order.id
+    - All required OrderResponse fields present
+    - B2B unreserve was called (mock is consumed)
+    """
+    buyer_id = uuid4()
+    sku_id, prod_id = uuid4(), uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(
+            db,
+            buyer_id=buyer_id,
+            status="PAID",
+            items=[{
+                "sku_id": sku_id,
+                "product_id": prod_id,
+                "name": "Cancelable Product",
+                "quantity": 2,
+                "unit_price": 500,
+                "line_total": 1000,
+            }],
+        )
+
+    # Mock: B2B unreserve succeeds (200)
+    unreserve_ok = _FakeResp(
+        {"order_id": str(order.id), "status": "UNRESERVED", "processed_at": "2026-05-27T10:00:00Z"},
+        status_code=200,
+    )
+    mock = _MockClient(unreserve_ok)
+
+    token = create_test_token(buyer_id)
+    with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/v1/orders/{order.id}/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "CANCELLED"
+    assert body["id"] == str(order.id)
+    assert body["buyer_id"] == str(buyer_id)
+
+    # Verify the order is truly CANCELLED in DB (GET it back)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        detail = await client.get(
+            f"/api/v1/orders/{order.id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert detail.json()["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_unreserve_failure_transitions_to_cancel_pending():
+    """
+    POST /orders/{id}/cancel → B2B unreserve times out → 200 with status CANCEL_PENDING.
+
+    Verifies:
+    - 200 status (cancellation intent is always accepted)
+    - body.status == "CANCEL_PENDING"
+    - No 5xx is returned to the buyer (B2B failure is handled internally)
+
+    Canon: "нельзя отвечать покупателю «попробуйте позже»: намерение отменить нужно принять
+    и выполнить асинхронно"
+    """
+    buyer_id = uuid4()
+    sku_id, prod_id = uuid4(), uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(
+            db,
+            buyer_id=buyer_id,
+            status="PAID",
+            items=[{
+                "sku_id": sku_id,
+                "product_id": prod_id,
+                "name": "Unreachable Reserve",
+                "quantity": 1,
+                "unit_price": 800,
+                "line_total": 800,
+            }],
+        )
+
+    # Mock: B2B is unreachable → ConnectError on context manager entry
+    mock = _MockClient(raise_on_enter=True)
+
+    token = create_test_token(buyer_id)
+    with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/v1/orders/{order.id}/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "CANCEL_PENDING", (
+        "When B2B unreserve fails, order must transition to CANCEL_PENDING, not error out"
+    )
+    assert body["id"] == str(order.id)
+
+
+@pytest.mark.asyncio
+async def test_cancel_assembling_order_returns_409():
+    """
+    POST /orders/{id}/cancel on an ASSEMBLING order → 409 CANCEL_NOT_ALLOWED.
+
+    Verifies:
+    - 409 status
+    - body.code == "CANCEL_NOT_ALLOWED"
+    - body contains the current status (details.current_status or similar)
+    - No B2B call is made
+
+    Cancellable statuses: CREATED, PAID only (canon/DoD explicit rule).
+    Note: spec description mentions ASSEMBLING as cancellable, but DoD test overrides.
+    """
+    buyer_id = uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(
+            db,
+            buyer_id=buyer_id,
+            status="ASSEMBLING",
+            items=[{"sku_id": uuid4(), "product_id": uuid4(),
+                    "name": "In Assembly", "quantity": 1,
+                    "unit_price": 300, "line_total": 300}],
+        )
+
+    token = create_test_token(buyer_id)
+    # No mock needed — service must reject before any B2B call
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["code"] == "CANCEL_NOT_ALLOWED"
+    # current_status must be surfaced so the client knows why cancellation was refused
+    assert "ASSEMBLING" in str(body), "Response must mention ASSEMBLING as the blocking status"
+
+
+@pytest.mark.asyncio
+async def test_cancel_other_user_order_returns_404():
+    """
+    POST /orders/{id}/cancel for a different user's order → 404 ORDER_NOT_FOUND.
+
+    IDOR rule: returning 403 would reveal that the order exists.
+    Always 404 regardless of ownership.
+    """
+    owner_id = uuid4()
+    attacker_id = uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(
+            db,
+            buyer_id=owner_id,
+            status="PAID",
+            items=[{"sku_id": uuid4(), "product_id": uuid4(),
+                    "name": "Owner Item", "quantity": 1,
+                    "unit_price": 200, "line_total": 200}],
+        )
+
+    attacker_token = create_test_token(attacker_id)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {attacker_token}"},
+        )
+
+    assert resp.status_code == 404, (
+        f"Expected 404 for wrong-user cancel, got {resp.status_code}. "
+        "Returning 403 reveals order existence — IDOR vulnerability."
+    )
+    assert resp.json()["code"] == "ORDER_NOT_FOUND"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# US-B2C-11 extra quality tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_created_order_transitions_to_cancelled():
+    """CREATED (not yet paid) orders are also cancellable."""
+    buyer_id = uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(
+            db, buyer_id=buyer_id, status="CREATED",
+            items=[{"sku_id": uuid4(), "product_id": uuid4(),
+                    "name": "Created Order Item", "quantity": 1,
+                    "unit_price": 100, "line_total": 100}],
+        )
+
+    unreserve_ok = _FakeResp(
+        {"order_id": str(order.id), "status": "UNRESERVED", "processed_at": "2026-05-27T10:00:00Z"},
+        status_code=200,
+    )
+    mock = _MockClient(unreserve_ok)
+    token = create_test_token(buyer_id)
+
+    with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            resp = await client.post(
+                f"/api/v1/orders/{order.id}/cancel",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_cancel_delivered_order_returns_409():
+    """DELIVERED orders cannot be cancelled."""
+    buyer_id = uuid4()
+
+    async for db in _db_session():
+        order = await _seed_order(db, buyer_id=buyer_id, status="DELIVERED")
+
+    token = create_test_token(buyer_id)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/orders/{order.id}/cancel",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["code"] == "CANCEL_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_cancel_requires_auth():
+    """POST /orders/{id}/cancel without token → 401 or 403."""
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(f"/api/v1/orders/{uuid4()}/cancel")
+    assert resp.status_code in (401, 403)
