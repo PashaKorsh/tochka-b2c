@@ -1,5 +1,5 @@
 """
-Orders router — US-B2C-09 (checkout) + US-B2C-10 (view orders).
+Orders router — US-B2C-09 (checkout) + US-B2C-10 (view) + US-B2C-11 (cancel).
 
 Spec: b2c/openapi.yaml (neomarket-protocols)
   POST /api/v1/orders
@@ -13,15 +13,20 @@ Spec: b2c/openapi.yaml (neomarket-protocols)
   GET /api/v1/orders
     Query:  limit, offset, status (optional filter)
     200:    PaginatedOrders {items, total_count, limit, offset}
-    401:    Unauthorized
 
   GET /api/v1/orders/{order_id}
     200:    OrderResponse
-    404:    Error {code: ORDER_NOT_FOUND}  <- also returned for wrong-user (IDOR)
+    404:    Error {code: ORDER_NOT_FOUND}
+
+  POST /api/v1/orders/{order_id}/cancel
+    Body:   {reason?: string}  (optional)
+    200:    OrderResponse (status=CANCELLED or CANCEL_PENDING)
+    404:    Error {code: ORDER_NOT_FOUND}   (also for wrong-user IDOR)
+    409:    Error {code: CANCEL_NOT_ALLOWED, details: {current_status}}
 
 Auth: Bearer JWT required on all endpoints. buyer_id comes ONLY from JWT claims.
 
-IDOR rule (canon b2c-orders-flows.md#b2c-10-view-orders):
+IDOR rule (canon b2c-orders-flows.md#b2c-10-view-orders, #b2c-11-cancel-order):
   Wrong-user order -> 404, never 403.
   Returning 403 would reveal that the order exists, enabling UUID enumeration.
 """
@@ -31,6 +36,7 @@ from uuid import UUID
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth import get_current_user_id
@@ -42,6 +48,11 @@ from backend.modules.orders.schemas import (
     PaginatedOrdersResponse,
 )
 from backend.modules.orders.service import OrdersService
+
+
+class CancelRequest(BaseModel):
+    """Optional body for POST /api/v1/orders/{id}/cancel."""
+    reason: Optional[str] = None
 
 router = APIRouter(prefix="/api/v1", tags=["Orders"])
 
@@ -207,4 +218,68 @@ async def get_order(
         raise HTTPException(
             status_code=400,
             detail={"code": "INVALID_REQUEST", "message": str(exc)},
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# POST /api/v1/orders/{order_id}/cancel  (US-B2C-11)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/orders/{order_id}/cancel",
+    response_model=OrderResponse,
+    summary="Cancel an order (CREATED or PAID only)",
+)
+async def cancel_order(
+    order_id: UUID,
+    body: CancelRequest = CancelRequest(),
+    db: AsyncSession = Depends(get_db),
+    buyer_id: UUID = Depends(get_current_user_id),
+) -> OrderResponse:
+    """
+    Cancel an order and release its stock reservation in B2B.
+
+    Cancellable statuses: CREATED, PAID.
+    Other statuses (ASSEMBLING, DELIVERING, DELIVERED, CANCEL_PENDING, CANCELLED)
+    → 409 CANCEL_NOT_ALLOWED with details.current_status.
+
+    If B2B unreserve succeeds → status becomes CANCELLED.
+    If B2B unreserve fails (network error) → status becomes CANCEL_PENDING.
+    In both cases the response is 200 (the cancellation intent is accepted).
+
+    IDOR: wrong-user order → 404 ORDER_NOT_FOUND (not 403).
+
+    Spec: b2c/openapi.yaml POST /api/v1/orders/{order_id}/cancel
+    Canon: b2c-orders-flows.md#b2c-11-cancel-order
+    """
+    try:
+        return await OrdersService.cancel_order(
+            db,
+            order_id=order_id,
+            buyer_id=buyer_id,
+            reason=body.reason,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if msg == "ORDER_NOT_FOUND":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ORDER_NOT_FOUND",
+                    "message": "Order not found",
+                },
+            )
+        if msg.startswith("CANCEL_NOT_ALLOWED:"):
+            current_status = msg.split(":", 1)[1]
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CANCEL_NOT_ALLOWED",
+                    "message": f"Cannot cancel order in status {current_status}",
+                    "details": {"current_status": current_status},
+                },
+            )
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "INVALID_REQUEST", "message": msg},
         )
