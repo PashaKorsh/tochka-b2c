@@ -24,6 +24,7 @@ from backend.modules.subscriptions import models as _sub_models  # noqa: F401 �
 from backend.modules.cart import models as _cart_models  # noqa: F401 — register CartItem with Base
 from backend.modules.banners import models as _banner_models  # noqa: F401 — register Banner/BannerEvent with Base
 from backend.modules.collections import models as _col_models  # noqa: F401 — register Collection/CollectionProduct with Base
+from backend.modules.orders import models as _order_models  # noqa: F401 — register Order/OrderItem with Base
 from backend.database import Base, get_db
 
 _TEST_DB_URL = os.getenv(
