@@ -131,6 +131,30 @@ async def create_order(
         )
     except ValueError as exc:
         msg = str(exc)
+        if msg == "ADDRESS_NOT_FOUND":
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ADDRESS_NOT_FOUND",
+                    "message": "Address not found or does not belong to this buyer",
+                },
+            )
+        if msg == "CART_EMPTY":
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "CART_EMPTY",
+                    "message": "Cart is empty — add items before checking out",
+                },
+            )
+        if msg == "CART_HAS_UNAVAILABLE_ITEMS":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "CART_HAS_UNAVAILABLE_ITEMS",
+                    "message": "One or more cart items are unavailable. Please validate cart before checkout.",
+                },
+            )
         if msg.startswith("SKU_NOT_FOUND:"):
             sku_id = msg.split(":", 1)[1]
             raise HTTPException(

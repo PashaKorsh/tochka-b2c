@@ -19,6 +19,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from backend.modules.addresses import models as _addr_models  # noqa: F401 — register Address with Base
 from backend.modules.favorites import models as _fav_models  # noqa: F401 — register Favorite with Base
 from backend.modules.subscriptions import models as _sub_models  # noqa: F401 — register ProductSubscription with Base
 from backend.modules.cart import models as _cart_models  # noqa: F401 — register CartItem with Base

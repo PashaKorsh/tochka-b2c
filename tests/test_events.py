@@ -80,12 +80,22 @@ async def _seed_order_with_item(
     sku_id: UUID,
     product_id: UUID,
 ) -> tuple[Order, OrderItem]:
+    import json as _json
+    from datetime import datetime, timezone as _tz
+    addr_id = uuid4()
+    addr_snap = _json.dumps({
+        "id": str(addr_id), "country": "RU", "city": "Москва",
+        "street": "Тестовая", "building": "1",
+        "created_at": datetime.now(_tz.utc).isoformat(),
+    })
     order = Order(
         id=uuid4(),
         buyer_id=buyer_id,
         idempotency_key=str(uuid4()),
         status="PAID",
-        delivery_address="Test address",
+        address_id=addr_id,
+        address_snapshot=addr_snap,
+        payment_method_id=uuid4(),
         subtotal=1000,
         total=1000,
     )

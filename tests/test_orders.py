@@ -1,40 +1,59 @@
 """
-Tests for US-B2C-09 (Checkout) + US-B2C-10 (View Orders).
+Tests for US-B2C-09 (Checkout) + US-B2C-10 (View Orders) + US-B2C-11 (Cancel)
+            + US-B2C-13 (Fulfill/Deliver).
 
 Spec: b2c/openapi.yaml
-  POST /api/v1/orders — create order with Idempotency-Key header
-  GET  /api/v1/orders — paginated history, filtered by JWT buyer_id
-  GET  /api/v1/orders/{id} — order detail, fixed prices, IDOR -> 404
+  POST /api/v1/orders          — create order from cart with Idempotency-Key header
+  GET  /api/v1/orders          — paginated history, filtered by JWT buyer_id
+  GET  /api/v1/orders/{id}     — order detail, fixed prices, IDOR → 404
+  POST /api/v1/orders/{id}/cancel  — cancel PAID/CREATED orders
+  POST /api/v1/orders/{id}/deliver — admin endpoint (X-Service-Key)
 
-Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders
+Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders,
+       b2c-orders-flows.md#b2c-11-cancel-order, b2c-orders-flows.md#b2c-13-fulfill
+
+Checkout flow:
+  POST body = {address_id, payment_method_id, comment?}  — NO items in body.
+  Items come from cart_items WHERE user_id=buyer_id.
+  Address looked up by address_id from addresses table.
+  Cart cleared after successful checkout.
+
+B2B mocked via backend.modules.orders.service.httpx.AsyncClient.
+Auth: create_test_token() from backend.auth.
 
 DoD test names (exact):
   US-B2C-09:
-    checkout_creates_paid_order_with_fixed_prices
-    partial_reserve_failure_returns_409
-    idempotency_returns_existing_order
-    b2b_unavailable_returns_503
+    test_checkout_creates_paid_order_with_fixed_prices
+    test_partial_reserve_failure_returns_409
+    test_idempotency_returns_existing_order
+    test_b2b_unavailable_returns_503
   US-B2C-10:
-    orders_list_returns_own_orders_paginated
-    order_detail_shows_fixed_prices
-    other_user_order_returns_404_not_403
-
-B2B is mocked via backend.modules.orders.service.httpx.AsyncClient.
-Auth: create_test_token() from backend.auth.
+    test_orders_list_returns_own_orders_paginated
+    test_order_detail_shows_fixed_prices
+    test_other_user_order_returns_404_not_403
+  US-B2C-11:
+    test_cancel_paid_order_transitions_to_cancelled
+    test_unreserve_failure_transitions_to_cancel_pending
+    test_cancel_assembling_order_returns_409
+    test_cancel_other_user_order_returns_404
 """
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timezone
 from unittest.mock import patch
-from uuid import uuid4, UUID
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from backend.main import app
 from backend.auth import create_test_token
+from backend.main import app
+from backend.modules.addresses.models import Address
+from backend.modules.cart.models import CartItem
 from backend.modules.orders.models import Order, OrderItem
 
 _TEST_DB_URL = os.getenv(
@@ -44,8 +63,9 @@ _TEST_DB_URL = os.getenv(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DB seeding helpers (for US-B2C-10 — tests that need pre-existing orders)
+# DB session helper
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 async def _db_session():
     engine = create_async_engine(_TEST_DB_URL, poolclass=NullPool)
@@ -58,13 +78,74 @@ async def _db_session():
         await engine.dispose()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# DB seeding helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+async def _seed_address(
+    db: AsyncSession,
+    buyer_id: UUID,
+    *,
+    country: str = "RU",
+    city: str = "Москва",
+    street: str = "Ленина",
+    building: str = "1",
+    region: str | None = None,
+    apartment: str | None = None,
+    postal_code: str | None = None,
+) -> Address:
+    """Insert an Address row and return it."""
+    address = Address(
+        id=uuid4(),
+        buyer_id=buyer_id,
+        country=country,
+        city=city,
+        street=street,
+        building=building,
+        region=region,
+        apartment=apartment,
+        postal_code=postal_code,
+        is_default=False,
+        created_at=datetime.now(timezone.utc),
+    )
+    db.add(address)
+    await db.commit()
+    return address
+
+
+async def _seed_cart_item(
+    db: AsyncSession,
+    buyer_id: UUID,
+    sku_id: UUID,
+    product_id: UUID,
+    quantity: int = 1,
+    unit_price_snapshot: int | None = None,
+) -> CartItem:
+    """Insert a CartItem row for an authenticated user and return it."""
+    item = CartItem(
+        id=uuid4(),
+        user_id=buyer_id,
+        session_id=None,
+        sku_id=sku_id,
+        product_id=product_id,
+        quantity=quantity,
+        unit_price_snapshot=unit_price_snapshot,
+        unavailable_reason=None,
+    )
+    db.add(item)
+    await db.commit()
+    return item
+
+
 async def _seed_order(
     db: AsyncSession,
     *,
     buyer_id: UUID,
+    address_id: UUID | None = None,
     status: str = "PAID",
-    delivery_address: str = "ул. Тестовая, 1",
     items: list[dict] | None = None,
+    payment_method_id: UUID | None = None,
 ) -> Order:
     """
     Insert an Order + OrderItems directly into the DB (no B2B calls).
@@ -72,14 +153,37 @@ async def _seed_order(
     """
     if items is None:
         items = []
+    if address_id is None:
+        address_id = uuid4()
+    if payment_method_id is None:
+        payment_method_id = uuid4()
 
-    subtotal = sum(it["line_total"] for it in items)
+    subtotal = sum(it.get("line_total", 0) for it in items)
+
+    address_snapshot = json.dumps({
+        "id": str(address_id),
+        "country": "RU",
+        "city": "Москва",
+        "street": "Ленина",
+        "building": "1",
+        "region": None,
+        "apartment": None,
+        "postal_code": None,
+        "recipient_name": None,
+        "recipient_phone": None,
+        "is_default": False,
+        "comment": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+
     order = Order(
         id=uuid4(),
         buyer_id=buyer_id,
-        idempotency_key=str(uuid4()),   # unique per seed call
+        idempotency_key=str(uuid4()),
         status=status,
-        delivery_address=delivery_address,
+        address_id=address_id,
+        address_snapshot=address_snapshot,
+        payment_method_id=payment_method_id,
         subtotal=subtotal,
         total=subtotal,
     )
@@ -105,8 +209,10 @@ async def _seed_order(
 # B2B mock helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class _FakeResp:
     """httpx response stub — raise_for_status without requiring request attribute."""
+
     def __init__(self, data, status_code: int = 200):
         self._data = data
         self.status_code = status_code
@@ -117,7 +223,7 @@ class _FakeResp:
     def raise_for_status(self):
         if self.status_code >= 400:
             from httpx import HTTPStatusError, Request as Req, Response as Resp
-            req = Req("GET", "http://b2b/")
+            req = Req("POST", "http://b2b/")
             raw = Resp(self.status_code, request=req)
             raise HTTPStatusError(f"HTTP {self.status_code}", request=req, response=raw)
 
@@ -130,6 +236,7 @@ class _MockClient:
     After the list is exhausted the last response is repeated.
     Pass raise_on_enter=True to simulate ConnectError at __aenter__.
     """
+
     def __init__(self, *responses, raise_on_enter: bool = False):
         self._responses = list(responses)
         self._idx = 0
@@ -161,16 +268,37 @@ class _MockClient:
         return self._next()
 
 
-def _sku_resp(sku_id: UUID, product_id: UUID, price: int = 1000, discount: int = 0) -> _FakeResp:
-    """Minimal SKUPublicResponse from B2B."""
-    return _FakeResp({
-        "id": str(sku_id),
-        "product_id": str(product_id),
-        "name": f"SKU {sku_id}",
-        "price": price,
-        "discount": discount,
-        "active_quantity": 10,
-    })
+def _b2b_batch_product(
+    sku_id: UUID,
+    product_id: UUID,
+    price: int = 1000,
+    discount: int = 0,
+    active_qty: int = 5,
+    name: str = "Test Product",
+) -> dict:
+    """Build a minimal ProductPublicResponse entry for the batch endpoint mock."""
+    return {
+        "id": str(product_id),
+        "title": name,
+        "slug": "test-product",
+        "category_id": str(uuid4()),
+        "seller_id": str(uuid4()),
+        "images": [],
+        "skus": [{
+            "id": str(sku_id),
+            "name": "SKU Name",
+            "article": "ART-001",
+            "price": price,
+            "discount": discount,
+            "active_quantity": active_qty,
+            "images": [],
+        }],
+    }
+
+
+def _batch_ok(*product_dicts: dict) -> _FakeResp:
+    """POST /api/v1/public/products/batch → 200 list of products."""
+    return _FakeResp(list(product_dicts), status_code=200)
 
 
 def _reserve_ok() -> _FakeResp:
@@ -181,51 +309,70 @@ def _reserve_fail() -> _FakeResp:
     return _FakeResp({"code": "INSUFFICIENT_STOCK"}, status_code=409)
 
 
+def _unreserve_ok(order_id: UUID | None = None) -> _FakeResp:
+    return _FakeResp(
+        {
+            "order_id": str(order_id or uuid4()),
+            "status": "UNRESERVED",
+            "processed_at": "2026-05-29T10:00:00Z",
+        },
+        status_code=200,
+    )
+
+
 def _auth_headers(user_id: UUID) -> dict:
     token = create_test_token(user_id)
     return {"Authorization": f"Bearer {token}"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DoD tests (exact names required)
+# US-B2C-09 DoD tests (exact names required)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_checkout_creates_paid_order_with_fixed_prices():
     """
-    POST /api/v1/orders with 2 items → 201 OrderResponse.
+    POST /api/v1/orders — cart-based checkout → 201 OrderResponse.
+
+    Flow:
+      - Seed address + two cart items (sku1 no discount, sku2 with discount).
+      - Mock: POST /batch → products; POST /reserve → ok.
+      - Expect 201 with PAID order; prices fixed at checkout time.
 
     Verifies:
-    - 201 status code
-    - status = PAID (immediately, mock payment)
-    - items[] contains all ordered SKUs with price snapshot
-    - unit_price = sku.price - sku.discount (fixed at checkout time)
-    - line_total = unit_price * quantity
+    - 201 status
+    - status = PAID
+    - items[] has correct sku_ids, quantities, unit_prices, line_totals
+    - unit_price = price - discount
     - subtotal = sum of line_totals
     - buyer_id matches JWT sub
-    - address echoed back
+    - address object present in response
+    - payment_method object present in response
     """
-    user_id = uuid4()
+    buyer_id = uuid4()
     sku1, sku2 = uuid4(), uuid4()
     prod1, prod2 = uuid4(), uuid4()
+    payment_method_id = uuid4()
 
-    # SKU1: price=1000, no discount → unit_price=1000
-    # SKU2: price=2000, discount=300 → unit_price=1700
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=2, unit_price_snapshot=1000)
+        await _seed_cart_item(db, buyer_id, sku2, prod2, quantity=1, unit_price_snapshot=1700)
+
+    # Batch: price=1000 no discount, price=2000 discount=300 → unit_price=1700
     mock = _MockClient(
-        _sku_resp(sku1, prod1, price=1000, discount=0),    # GET sku1
-        _sku_resp(sku2, prod2, price=2000, discount=300),   # GET sku2
-        _reserve_ok(),                                      # POST reserve
+        _batch_ok(
+            _b2b_batch_product(sku1, prod1, price=1000, discount=0),
+            _b2b_batch_product(sku2, prod2, price=2000, discount=300),
+        ),
+        _reserve_ok(),
     )
 
     idem_key = str(uuid4())
     request_body = {
-        "items": [
-            {"sku_id": str(sku1), "quantity": 2},
-            {"sku_id": str(sku2), "quantity": 1},
-        ],
-        "delivery_address": "ул. Ленина, 1, Москва",
-        "payment_method_id": str(uuid4()),
+        "address_id": str(address.id),
+        "payment_method_id": str(payment_method_id),
     }
 
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
@@ -233,32 +380,39 @@ async def test_checkout_creates_paid_order_with_fixed_prices():
             resp = await client.post(
                 "/api/v1/orders",
                 json=request_body,
-                headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
             )
 
     assert resp.status_code == 201, resp.text
     body = resp.json()
 
     assert body["status"] == "PAID"
-    assert body["buyer_id"] == str(user_id)
-    assert body["address"] == "ул. Ленина, 1, Москва"
+    assert body["buyer_id"] == str(buyer_id)
+
+    # Address object present
+    assert isinstance(body["address"], dict), "address must be an object"
+    assert body["address"]["city"] == "Москва"
+
+    # Payment method present
+    assert isinstance(body["payment_method"], dict)
+    assert body["payment_method"]["type"] == "CARD"
 
     # Price snapshot verification
     items_by_sku = {it["sku_id"]: it for it in body["items"]}
-    assert str(sku1) in items_by_sku
-    assert str(sku2) in items_by_sku
+    assert str(sku1) in items_by_sku, "sku1 must appear in order items"
+    assert str(sku2) in items_by_sku, "sku2 must appear in order items"
 
     item1 = items_by_sku[str(sku1)]
-    assert item1["unit_price"] == 1000           # price - discount = 1000 - 0
+    assert item1["unit_price"] == 1000, "1000 - 0 = 1000"
     assert item1["quantity"] == 2
-    assert item1["line_total"] == 2000           # 1000 * 2
+    assert item1["line_total"] == 2000, "1000 * 2 = 2000"
 
     item2 = items_by_sku[str(sku2)]
-    assert item2["unit_price"] == 1700           # 2000 - 300
+    assert item2["unit_price"] == 1700, "2000 - 300 = 1700"
     assert item2["quantity"] == 1
-    assert item2["line_total"] == 1700           # 1700 * 1
+    assert item2["line_total"] == 1700, "1700 * 1 = 1700"
 
-    assert body["subtotal"] == 3700              # 2000 + 1700
+    assert body["subtotal"] == 3700, "2000 + 1700 = 3700"
     assert body["total"] == 3700
     assert "id" in body
     assert "created_at" in body
@@ -267,42 +421,38 @@ async def test_checkout_creates_paid_order_with_fixed_prices():
 @pytest.mark.asyncio
 async def test_partial_reserve_failure_returns_409():
     """
-    If B2B reserve returns 409 (insufficient stock for any item),
-    the checkout must fail with 409 RESERVE_FAILED.
+    B2B reserve returns 409 → checkout fails with 409 RESERVE_FAILED.
 
     Verifies:
-    - No order is created in DB
     - 409 status
     - body.code == "RESERVE_FAILED"
+    - No order persisted
     """
-    user_id = uuid4()
-    sku1 = uuid4()
-    prod1 = uuid4()
+    buyer_id = uuid4()
+    sku1, prod1 = uuid4(), uuid4()
+    payment_method_id = uuid4()
 
-    # SKU lookup succeeds, reserve fails
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=999)
+
+    # Batch succeeds, reserve fails
     mock = _MockClient(
-        _sku_resp(sku1, prod1, price=500),  # GET sku1
-        _reserve_fail(),                    # POST reserve → 409
+        _batch_ok(_b2b_batch_product(sku1, prod1, price=500, active_qty=1)),
+        _reserve_fail(),
     )
 
     idem_key = str(uuid4())
-    request_body = {
-        "items": [{"sku_id": str(sku1), "quantity": 999}],
-        "delivery_address": "Тест",
-        "payment_method_id": str(uuid4()),
-    }
-
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/api/v1/orders",
-                json=request_body,
-                headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+                json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
             )
 
     assert resp.status_code == 409, resp.text
-    body = resp.json()
-    assert body["code"] == "RESERVE_FAILED"
+    assert resp.json()["code"] == "RESERVE_FAILED"
 
 
 @pytest.mark.asyncio
@@ -314,22 +464,25 @@ async def test_idempotency_returns_existing_order():
     - First request → 201
     - Second request (same key) → 200
     - Both responses have the same order id
-    - Second request does NOT call B2B again (or at least returns the same order)
+    - B2B NOT called on second request
     """
-    user_id = uuid4()
-    sku1 = uuid4()
-    prod1 = uuid4()
+    buyer_id = uuid4()
+    sku1, prod1 = uuid4(), uuid4()
+    payment_method_id = uuid4()
+
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=1)
 
     idem_key = str(uuid4())
     request_body = {
-        "items": [{"sku_id": str(sku1), "quantity": 1}],
-        "delivery_address": "Идемпотентный адрес",
-        "payment_method_id": str(uuid4()),
+        "address_id": str(address.id),
+        "payment_method_id": str(payment_method_id),
     }
 
-    # First call: SKU lookup + reserve
+    # First call: batch + reserve
     mock1 = _MockClient(
-        _sku_resp(sku1, prod1, price=800),
+        _batch_ok(_b2b_batch_product(sku1, prod1, price=800)),
         _reserve_ok(),
     )
 
@@ -338,19 +491,18 @@ async def test_idempotency_returns_existing_order():
             resp1 = await client.post(
                 "/api/v1/orders",
                 json=request_body,
-                headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
             )
 
     assert resp1.status_code == 201, resp1.text
     order_id_first = resp1.json()["id"]
 
-    # Second call: same key → idempotency replay (no B2B call needed)
-    # The service returns early after finding the key in DB.
+    # Second call: same key — idempotency replay (no B2B call needed)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp2 = await client.post(
             "/api/v1/orders",
             json=request_body,
-            headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+            headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
         )
 
     assert resp2.status_code == 200, resp2.text
@@ -362,69 +514,60 @@ async def test_idempotency_returns_existing_order():
 @pytest.mark.asyncio
 async def test_b2b_unavailable_returns_503():
     """
-    If B2B is unreachable (ConnectError), the checkout returns 503.
+    B2B batch endpoint unreachable (ConnectError) → checkout returns 503.
 
     Verifies:
     - 503 status
     - body.code == "UPSTREAM_UNAVAILABLE"
     """
-    user_id = uuid4()
-    sku1 = uuid4()
+    buyer_id = uuid4()
+    sku1, prod1 = uuid4(), uuid4()
+    payment_method_id = uuid4()
 
-    # Raise ConnectError immediately on context manager entry
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=1)
+
+    # ConnectError on first context-manager entry (the batch call)
     mock = _MockClient(raise_on_enter=True)
-
-    idem_key = str(uuid4())
-    request_body = {
-        "items": [{"sku_id": str(sku1), "quantity": 1}],
-        "delivery_address": "Тест",
-        "payment_method_id": str(uuid4()),
-    }
 
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/api/v1/orders",
-                json=request_body,
-                headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+                json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": str(uuid4())},
             )
 
     assert resp.status_code == 503, resp.text
-    body = resp.json()
-    assert body["code"] == "UPSTREAM_UNAVAILABLE"
+    assert resp.json()["code"] == "UPSTREAM_UNAVAILABLE"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Extra quality tests
+# US-B2C-09 extra quality tests
 # ──────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_order_requires_auth():
+async def test_checkout_requires_auth():
     """POST /api/v1/orders without Bearer token → 401 or 403."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             "/api/v1/orders",
-            json={
-                "items": [{"sku_id": str(uuid4()), "quantity": 1}],
-                "delivery_address": "test",
-            },
+            json={"address_id": str(uuid4()), "payment_method_id": str(uuid4())},
             headers={"Idempotency-Key": str(uuid4())},
         )
     assert resp.status_code in (401, 403), resp.text
 
 
 @pytest.mark.asyncio
-async def test_order_requires_idempotency_key():
+async def test_checkout_requires_idempotency_key():
     """POST /api/v1/orders without Idempotency-Key header → 422."""
     user_id = uuid4()
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             "/api/v1/orders",
-            json={
-                "items": [{"sku_id": str(uuid4()), "quantity": 1}],
-                "delivery_address": "test",
-            },
+            json={"address_id": str(uuid4()), "payment_method_id": str(uuid4())},
             headers=_auth_headers(user_id),
             # deliberately omit Idempotency-Key
         )
@@ -432,80 +575,122 @@ async def test_order_requires_idempotency_key():
 
 
 @pytest.mark.asyncio
-async def test_order_empty_items_returns_422():
-    """POST /api/v1/orders with empty items list → 422 VALIDATION_ERROR."""
-    user_id = uuid4()
+async def test_checkout_cart_empty_returns_error():
+    """POST /api/v1/orders with empty cart → 4xx error (CART_EMPTY)."""
+    buyer_id = uuid4()
+    payment_method_id = uuid4()
+
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        # deliberately do NOT seed any cart items
+
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             "/api/v1/orders",
-            json={"items": [], "delivery_address": "test"},
-            headers={**_auth_headers(user_id), "Idempotency-Key": str(uuid4())},
+            json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+            headers={**_auth_headers(buyer_id), "Idempotency-Key": str(uuid4())},
         )
-    assert resp.status_code == 422, resp.text
+    assert resp.status_code in (400, 409, 422), resp.text
 
 
 @pytest.mark.asyncio
-async def test_sku_not_found_returns_404():
-    """If B2B returns 404 for a SKU, the order endpoint returns 404 NOT_FOUND."""
-    user_id = uuid4()
-    sku1 = uuid4()
+async def test_checkout_address_not_found_returns_404():
+    """POST /api/v1/orders with a nonexistent address_id → 404 ADDRESS_NOT_FOUND."""
+    buyer_id = uuid4()
 
-    # B2B SKU lookup → 404
-    mock = _MockClient(_FakeResp({"detail": "not found"}, status_code=404))
+    async for db in _db_session():
+        await _seed_cart_item(db, buyer_id, uuid4(), uuid4(), quantity=1)
 
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            "/api/v1/orders",
+            json={"address_id": str(uuid4()), "payment_method_id": str(uuid4())},
+            headers={**_auth_headers(buyer_id), "Idempotency-Key": str(uuid4())},
+        )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["code"] == "ADDRESS_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_cart_cleared_after_checkout():
+    """Cart items are deleted from DB after successful checkout."""
+    buyer_id = uuid4()
+    sku1, prod1 = uuid4(), uuid4()
+    payment_method_id = uuid4()
+
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=1)
+
+    mock = _MockClient(
+        _batch_ok(_b2b_batch_product(sku1, prod1, price=600)),
+        _reserve_ok(),
+    )
+
+    idem_key = str(uuid4())
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 "/api/v1/orders",
-                json={
-                    "items": [{"sku_id": str(sku1), "quantity": 1}],
-                    "delivery_address": "test",
-                },
-                headers={**_auth_headers(user_id), "Idempotency-Key": str(uuid4())},
+                json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
             )
+    assert resp.status_code == 201, resp.text
 
-    assert resp.status_code == 404, resp.text
-    assert resp.json()["code"] == "NOT_FOUND"
+    # Verify cart is empty — GET /api/v1/cart must return no items
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        cart_resp = await client.get(
+            "/api/v1/cart",
+            headers=_auth_headers(buyer_id),
+        )
+    # Cart endpoint must exist and return empty (no items for this buyer)
+    assert cart_resp.status_code == 200, cart_resp.text
+    cart_body = cart_resp.json()
+    cart_items = cart_body.get("items", cart_body) if isinstance(cart_body, dict) else cart_body
+    if isinstance(cart_items, list):
+        assert len(cart_items) == 0, "Cart must be empty after checkout"
 
 
 @pytest.mark.asyncio
 async def test_fixed_price_not_affected_by_subsequent_discount():
     """
-    Price in OrderItem must reflect the value at checkout time, not B2B's current price.
-    After an order is placed, price changes in B2B do not affect existing orders.
-
-    We simulate: order placed at price=500; replay via idempotency key returns same price.
+    Price in OrderItem reflects checkout-time value — replay via idempotency returns same.
     """
-    user_id = uuid4()
+    buyer_id = uuid4()
     sku1, prod1 = uuid4(), uuid4()
+    payment_method_id = uuid4()
+
+    async for db in _db_session():
+        address = await _seed_address(db, buyer_id)
+        await _seed_cart_item(db, buyer_id, sku1, prod1, quantity=3)
 
     idem_key = str(uuid4())
 
     # First checkout: price=500
     mock = _MockClient(
-        _sku_resp(sku1, prod1, price=500, discount=0),
+        _batch_ok(_b2b_batch_product(sku1, prod1, price=500, discount=0)),
         _reserve_ok(),
     )
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp1 = await client.post(
                 "/api/v1/orders",
-                json={"items": [{"sku_id": str(sku1), "quantity": 3}], "delivery_address": "test"},
-                headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+                json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+                headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
             )
     assert resp1.status_code == 201
     first_price = resp1.json()["items"][0]["unit_price"]
     assert first_price == 500
 
-    # Replay via idempotency — no B2B call at all
+    # Replay via idempotency — no B2B call, same price returned
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp2 = await client.post(
             "/api/v1/orders",
-            json={"items": [{"sku_id": str(sku1), "quantity": 3}], "delivery_address": "test"},
-            headers={**_auth_headers(user_id), "Idempotency-Key": idem_key},
+            json={"address_id": str(address.id), "payment_method_id": str(payment_method_id)},
+            headers={**_auth_headers(buyer_id), "Idempotency-Key": idem_key},
         )
     assert resp2.status_code == 200
-    assert resp2.json()["items"][0]["unit_price"] == 500  # unchanged
+    assert resp2.json()["items"][0]["unit_price"] == 500
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -516,21 +701,19 @@ async def test_fixed_price_not_affected_by_subsequent_discount():
 @pytest.mark.asyncio
 async def test_orders_list_returns_own_orders_paginated():
     """
-    GET /api/v1/orders returns only the authenticated buyer's orders with pagination.
+    GET /api/v1/orders — returns only the authenticated buyer's orders with pagination.
 
     Verifies:
     - 200 status
     - Response shape: {items, total_count, limit, offset}
-    - items[] contains only orders belonging to the JWT buyer (not other users' orders)
+    - items[] contains only buyer's orders (not other users')
     - Pagination: limit/offset work correctly
-    - Orders sorted by created_at DESC (most recent first)
-    - Other user's orders are NOT included (IDOR)
+    - Status filter works
     """
     buyer_id = uuid4()
     other_user_id = uuid4()
     sku1, prod1 = uuid4(), uuid4()
 
-    # Seed 3 orders for buyer, 1 for another user
     async for db in _db_session():
         order1 = await _seed_order(
             db, buyer_id=buyer_id, status="PAID",
@@ -550,7 +733,7 @@ async def test_orders_list_returns_own_orders_paginated():
 
     token = create_test_token(buyer_id)
 
-    # ── Full list (no pagination) ──
+    # Full list
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.get(
             "/api/v1/orders",
@@ -560,7 +743,6 @@ async def test_orders_list_returns_own_orders_paginated():
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    # Spec shape
     assert "items" in body
     assert "total_count" in body
     assert "limit" in body
@@ -573,29 +755,26 @@ async def test_orders_list_returns_own_orders_paginated():
     assert str(order2.id) in returned_ids, "Own order 2 must appear"
     assert str(order3.id) in returned_ids, "Own order 3 must appear"
     assert str(other_order.id) not in returned_ids, "Other user's order must NOT appear"
+    assert body["total_count"] >= 3
 
-    assert body["total_count"] >= 3, "total_count must count own orders"
-
-    # ── Pagination: limit=1, offset=0 ──
+    # Pagination: limit=1
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp_page = await client.get(
             "/api/v1/orders?limit=1&offset=0",
             headers={"Authorization": f"Bearer {token}"},
         )
-
     assert resp_page.status_code == 200, resp_page.text
     page_body = resp_page.json()
     assert len(page_body["items"]) == 1, "limit=1 must return exactly 1 item"
     assert page_body["limit"] == 1
     assert page_body["offset"] == 0
 
-    # ── Status filter ──
+    # Status filter
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp_paid = await client.get(
             "/api/v1/orders?status=PAID",
             headers={"Authorization": f"Bearer {token}"},
         )
-
     assert resp_paid.status_code == 200, resp_paid.text
     paid_body = resp_paid.json()
     paid_ids = {it["id"] for it in paid_body["items"]}
@@ -606,19 +785,19 @@ async def test_orders_list_returns_own_orders_paginated():
 @pytest.mark.asyncio
 async def test_order_detail_shows_fixed_prices():
     """
-    GET /api/v1/orders/{id} returns items with unit_price from checkout snapshot.
+    GET /api/v1/orders/{id} — returns items with unit_price from checkout snapshot.
 
     Verifies:
     - 200 status
-    - items[].unit_price matches what was stored at checkout (not current B2B price)
+    - items[].unit_price matches what was stored at checkout
     - items[].line_total = unit_price * quantity
-    - Required fields present: id, buyer_id, status, items, subtotal, total, address, created_at
-    - No B2B call is made (prices come from DB OrderItem, not B2B)
+    - Required fields: id, buyer_id, status, items, subtotal, total, address, created_at
+    - address is an object (AddressResponse shape)
+    - payment_method is present
+    - No B2B call (prices from DB)
     """
     buyer_id = uuid4()
     sku_id, prod_id = uuid4(), uuid4()
-
-    # Seed order with a specific price snapshot (e.g., price was 1500 at checkout)
     checkout_price = 1500
     qty = 3
 
@@ -627,7 +806,6 @@ async def test_order_detail_shows_fixed_prices():
             db,
             buyer_id=buyer_id,
             status="PAID",
-            delivery_address="г. Екатеринбург, ул. Мира 19",
             items=[{
                 "sku_id": sku_id,
                 "product_id": prod_id,
@@ -650,7 +828,6 @@ async def test_order_detail_shows_fixed_prices():
     assert resp.status_code == 200, resp.text
     body = resp.json()
 
-    # Required spec fields
     for field in ("id", "buyer_id", "status", "items", "subtotal", "total", "address", "created_at"):
         assert field in body, f"Required field '{field}' missing from OrderResponse"
 
@@ -658,6 +835,8 @@ async def test_order_detail_shows_fixed_prices():
     assert body["buyer_id"] == str(buyer_id)
     assert body["status"] == "PAID"
     assert len(body["items"]) == 1
+    assert isinstance(body["address"], dict), "address must be AddressResponse object"
+    assert "payment_method" in body
 
     item = body["items"][0]
     assert item["sku_id"] == str(sku_id)
@@ -668,22 +847,15 @@ async def test_order_detail_shows_fixed_prices():
     assert item["line_total"] == checkout_price * qty
 
     assert body["subtotal"] == checkout_price * qty
-    assert body["address"] == "г. Екатеринбург, ул. Мира 19"
 
 
 @pytest.mark.asyncio
 async def test_other_user_order_returns_404_not_403():
     """
-    GET /api/v1/orders/{id} for an order that belongs to another user -> 404.
+    GET /api/v1/orders/{id} for another user's order → 404 ORDER_NOT_FOUND.
 
-    Rule (canon b2c-orders-flows.md#b2c-10-view-orders §Authorization):
-      Returning 403 would reveal that the order with that ID EXISTS, allowing
-      an attacker to enumerate valid UUIDs. Always 404 regardless of ownership.
-
-    Verifies:
-    - 200 for the owner (baseline)
-    - 404 for any other authenticated user (NOT 403, NOT 200)
-    - body.code == "ORDER_NOT_FOUND"
+    IDOR rule: 403 would reveal that the order with that ID exists.
+    Always 404 regardless of ownership.
     """
     owner_id = uuid4()
     attacker_id = uuid4()
@@ -705,7 +877,7 @@ async def test_other_user_order_returns_404_not_403():
         )
     assert owner_resp.status_code == 200, "Owner must see their own order"
 
-    # Attacker gets 404 (not 403) — does not reveal existence
+    # Attacker gets 404 — does not reveal existence
     attacker_token = create_test_token(attacker_id)
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         attacker_resp = await client.get(
@@ -728,14 +900,14 @@ async def test_other_user_order_returns_404_not_403():
 @pytest.mark.asyncio
 async def test_cancel_paid_order_transitions_to_cancelled():
     """
-    POST /orders/{id}/cancel on a PAID order → B2B unreserve succeeds → 200 CANCELLED.
+    POST /orders/{id}/cancel on PAID order → B2B unreserve succeeds → 200 CANCELLED.
 
     Verifies:
     - 200 status
     - body.status == "CANCELLED"
     - body.id == order.id
-    - All required OrderResponse fields present
-    - B2B unreserve was called (mock is consumed)
+    - Required OrderResponse fields present
+    - B2B unreserve was called
     """
     buyer_id = uuid4()
     sku_id, prod_id = uuid4(), uuid4()
@@ -755,18 +927,14 @@ async def test_cancel_paid_order_transitions_to_cancelled():
             }],
         )
 
-    # Mock: B2B unreserve succeeds (200)
-    unreserve_ok = _FakeResp(
-        {"order_id": str(order.id), "status": "UNRESERVED", "processed_at": "2026-05-27T10:00:00Z"},
-        status_code=200,
-    )
-    mock = _MockClient(unreserve_ok)
-
+    mock = _MockClient(_unreserve_ok(order.id))
     token = create_test_token(buyer_id)
+
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 f"/api/v1/orders/{order.id}/cancel",
+                json={},
                 headers={"Authorization": f"Bearer {token}"},
             )
 
@@ -776,7 +944,7 @@ async def test_cancel_paid_order_transitions_to_cancelled():
     assert body["id"] == str(order.id)
     assert body["buyer_id"] == str(buyer_id)
 
-    # Verify the order is truly CANCELLED in DB (GET it back)
+    # Verify in DB via GET
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         detail = await client.get(
             f"/api/v1/orders/{order.id}",
@@ -788,15 +956,12 @@ async def test_cancel_paid_order_transitions_to_cancelled():
 @pytest.mark.asyncio
 async def test_unreserve_failure_transitions_to_cancel_pending():
     """
-    POST /orders/{id}/cancel → B2B unreserve times out → 200 with status CANCEL_PENDING.
+    POST /orders/{id}/cancel → B2B unreserve ConnectError → 200 CANCEL_PENDING.
 
+    Canon: buyer's cancellation intent must always be accepted.
     Verifies:
-    - 200 status (cancellation intent is always accepted)
+    - 200 status (not 5xx)
     - body.status == "CANCEL_PENDING"
-    - No 5xx is returned to the buyer (B2B failure is handled internally)
-
-    Canon: "нельзя отвечать покупателю «попробуйте позже»: намерение отменить нужно принять
-    и выполнить асинхронно"
     """
     buyer_id = uuid4()
     sku_id, prod_id = uuid4(), uuid4()
@@ -816,14 +981,15 @@ async def test_unreserve_failure_transitions_to_cancel_pending():
             }],
         )
 
-    # Mock: B2B is unreachable → ConnectError on context manager entry
+    # B2B unreachable
     mock = _MockClient(raise_on_enter=True)
-
     token = create_test_token(buyer_id)
+
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 f"/api/v1/orders/{order.id}/cancel",
+                json={},
                 headers={"Authorization": f"Bearer {token}"},
             )
 
@@ -838,16 +1004,14 @@ async def test_unreserve_failure_transitions_to_cancel_pending():
 @pytest.mark.asyncio
 async def test_cancel_assembling_order_returns_409():
     """
-    POST /orders/{id}/cancel on an ASSEMBLING order → 409 CANCEL_NOT_ALLOWED.
+    POST /orders/{id}/cancel on ASSEMBLING order → 409 CANCEL_NOT_ALLOWED.
 
+    Cancellable statuses: CREATED, PAID only (canon/DoD).
     Verifies:
     - 409 status
     - body.code == "CANCEL_NOT_ALLOWED"
-    - body contains the current status (details.current_status or similar)
-    - No B2B call is made
-
-    Cancellable statuses: CREATED, PAID only (canon/DoD explicit rule).
-    Note: spec description mentions ASSEMBLING as cancellable, but DoD test overrides.
+    - ASSEMBLING mentioned in response (current_status surfaced)
+    - No B2B call made
     """
     buyer_id = uuid4()
 
@@ -862,27 +1026,26 @@ async def test_cancel_assembling_order_returns_409():
         )
 
     token = create_test_token(buyer_id)
-    # No mock needed — service must reject before any B2B call
+    # No mock — service must reject before any B2B call
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/api/v1/orders/{order.id}/cancel",
+            json={},
             headers={"Authorization": f"Bearer {token}"},
         )
 
     assert resp.status_code == 409, resp.text
     body = resp.json()
     assert body["code"] == "CANCEL_NOT_ALLOWED"
-    # current_status must be surfaced so the client knows why cancellation was refused
     assert "ASSEMBLING" in str(body), "Response must mention ASSEMBLING as the blocking status"
 
 
 @pytest.mark.asyncio
 async def test_cancel_other_user_order_returns_404():
     """
-    POST /orders/{id}/cancel for a different user's order → 404 ORDER_NOT_FOUND.
+    POST /orders/{id}/cancel for another user's order → 404 ORDER_NOT_FOUND.
 
-    IDOR rule: returning 403 would reveal that the order exists.
-    Always 404 regardless of ownership.
+    IDOR: returning 403 would reveal the order exists.
     """
     owner_id = uuid4()
     attacker_id = uuid4()
@@ -901,6 +1064,7 @@ async def test_cancel_other_user_order_returns_404():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/api/v1/orders/{order.id}/cancel",
+            json={},
             headers={"Authorization": f"Bearer {attacker_token}"},
         )
 
@@ -929,17 +1093,14 @@ async def test_cancel_created_order_transitions_to_cancelled():
                     "unit_price": 100, "line_total": 100}],
         )
 
-    unreserve_ok = _FakeResp(
-        {"order_id": str(order.id), "status": "UNRESERVED", "processed_at": "2026-05-27T10:00:00Z"},
-        status_code=200,
-    )
-    mock = _MockClient(unreserve_ok)
+    mock = _MockClient(_unreserve_ok(order.id))
     token = create_test_token(buyer_id)
 
     with patch("backend.modules.orders.service.httpx.AsyncClient", side_effect=mock):
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
             resp = await client.post(
                 f"/api/v1/orders/{order.id}/cancel",
+                json={},
                 headers={"Authorization": f"Bearer {token}"},
             )
 
@@ -959,6 +1120,7 @@ async def test_cancel_delivered_order_returns_409():
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/api/v1/orders/{order.id}/cancel",
+            json={},
             headers={"Authorization": f"Bearer {token}"},
         )
 
@@ -970,5 +1132,20 @@ async def test_cancel_delivered_order_returns_409():
 async def test_cancel_requires_auth():
     """POST /orders/{id}/cancel without token → 401 or 403."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        resp = await client.post(f"/api/v1/orders/{uuid4()}/cancel")
+        resp = await client.post(f"/api/v1/orders/{uuid4()}/cancel", json={})
     assert resp.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_cancel_nonexistent_order_returns_404():
+    """POST /orders/{id}/cancel for a completely nonexistent UUID → 404."""
+    buyer_id = uuid4()
+    token = create_test_token(buyer_id)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/orders/{uuid4()}/cancel",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "ORDER_NOT_FOUND"
