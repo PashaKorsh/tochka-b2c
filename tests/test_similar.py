@@ -18,12 +18,15 @@ Extra:
 
 Algorithm (canon b2c-catalog-flows.md#b2c-4-similar-products):
   1. Fetch target product from B2B to validate existence and get category_id.
-  2. Fetch visible products in that category (limit+1 to compensate for self-exclusion).
+  2. Fetch a wider batch (limit*3, min 30) from same category for shuffle variety.
   3. Filter out current product_id from results.
-  4. Return up to limit items as CatalogProductCard list.
+  4. If len(similar) < limit: parent-category fallback — GET /categories/{id} for
+     parent_id, then fetch from parent category and merge (deduplicated).
+  5. random.shuffle + cap at limit.
 
-Mock strategy: _get_similar makes TWO sequential httpx.AsyncClient calls.
+Mock strategy: _get_similar makes up to 4 sequential httpx.AsyncClient calls.
   _SequenceMockClient iterates through a pre-loaded list of responses — one per call.
+  When exhausted, returns empty {} so fallback path is skipped gracefully.
 """
 from __future__ import annotations
 
@@ -92,6 +95,24 @@ def _b2b_catalog_page(items: list[dict]) -> dict:
     return {"items": items, "total_count": len(items), "limit": 20, "offset": 0}
 
 
+PARENT_CATEGORY_ID = str(uuid4())
+
+
+def _make_b2b_category(
+    category_id: str = CATEGORY_ID,
+    parent_id: str | None = None,
+) -> dict:
+    """Build a B2B CategoryResponse for the category detail endpoint."""
+    return {
+        "id": category_id,
+        "name": "Electronics",
+        "parent_id": parent_id,
+        "level": 1 if parent_id else 0,
+        "path": f"electronics/{category_id}" if parent_id else category_id,
+        "children": [],
+    }
+
+
 class _FakeResp:
     def __init__(self, data: dict | None = None, status_code: int = 200):
         self._data = data or {}
@@ -115,12 +136,15 @@ class _SequenceMockClient:
     """
     Async context-manager stub that serves responses in sequence.
 
-    _get_similar makes TWO sequential AsyncClient instantiations (one per
-    `async with httpx.AsyncClient(...) as client:`):
-      Call 1 → product detail (to validate existence / get category_id)
-      Call 2 → catalog list (filtered by category)
+    _get_similar now makes up to 4 sequential AsyncClient instantiations:
+      Call 1 → product detail (validate existence / get category_id)
+      Call 2 → catalog list in same category (wider batch for shuffle)
+      Call 3 → category detail (get parent_id for fallback) [only if len<limit]
+      Call 4 → catalog list in parent category              [only if parent_id found]
 
-    Each new `__aenter__` pops the next response from the list.
+    When the response list is exhausted, returns an empty 200 response so that
+    tests that don't mock the fallback path (calls 3-4) degrade gracefully:
+    parent_id will be missing → fallback skipped → primary results returned.
     """
 
     def __init__(self, responses: list[_FakeResp | Exception]):
@@ -129,8 +153,11 @@ class _SequenceMockClient:
 
     def __call__(self, **kwargs):
         """Called when `httpx.AsyncClient(...)` is instantiated."""
-        resp = self._responses[self._index]
-        self._index += 1
+        if self._index < len(self._responses):
+            resp = self._responses[self._index]
+            self._index += 1
+        else:
+            resp = _FakeResp({})  # graceful exhaustion: empty 200 → fallback skipped
         return _SingleResponseClient(resp)
 
 
@@ -366,3 +393,165 @@ async def test_similar_non_moderated_product_returns_404(client):
 
         assert resp.status_code == 404, f"Expected 404 for status={bad_status}, got {resp.status_code}"
         assert resp.json()["code"] == "NOT_FOUND"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Random shuffle: results are a valid subset (not ordered by date)
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_similar_results_are_shuffled(client):
+    """
+    ADR: B2B has no sort=random. B2C fetches a wide batch and shuffles in-place.
+    Verify: result items are a valid subset of available products (no phantoms),
+    and the count matches the limit. Exact order is not asserted.
+    """
+    product = _make_b2b_product_detail(product_id=PRODUCT_ID, category_id=CATEGORY_ID)
+
+    available = [_make_b2b_short_product(title=f"P{i}") for i in range(15)]
+    catalog_page = _b2b_catalog_page(available)
+
+    mock = _SequenceMockClient([_FakeResp(product), _FakeResp(catalog_page)])
+
+    with patch("backend.modules.catalog.service.httpx.AsyncClient", side_effect=mock):
+        async with client as ac:
+            resp = await ac.get(
+                f"/api/v1/catalog/products/{PRODUCT_ID}/similar",
+                params={"limit": 8},
+            )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) == 8
+
+    available_ids = {p["id"] for p in available}
+    for item in data:
+        assert item["id"] in available_ids, "Result contains an ID not from B2B response"
+        assert item["id"] != PRODUCT_ID, "Current product must not be in results"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parent-category fallback
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_similar_fallback_to_parent_category(client):
+    """
+    Canon §4 step 3: when primary category has fewer than `limit` visible products,
+    B2C fetches from the parent category and merges results (deduplicated).
+
+    Setup:
+      - Primary category has 2 visible products (< limit=5).
+      - Category detail returns parent_id.
+      - Parent category has 4 more products.
+    Expected: 2 + 4 = 6 items, capped at limit=5.
+    """
+    product = _make_b2b_product_detail(product_id=PRODUCT_ID, category_id=CATEGORY_ID)
+
+    primary_items = [_make_b2b_short_product(title=f"Primary {i}") for i in range(2)]
+    primary_page = _b2b_catalog_page(primary_items)
+
+    category_detail = _make_b2b_category(category_id=CATEGORY_ID, parent_id=PARENT_CATEGORY_ID)
+
+    parent_items = [_make_b2b_short_product(title=f"Parent {i}") for i in range(4)]
+    parent_page = _b2b_catalog_page(parent_items)
+
+    mock = _SequenceMockClient([
+        _FakeResp(product),           # Call 1: product detail
+        _FakeResp(primary_page),      # Call 2: primary category products
+        _FakeResp(category_detail),   # Call 3: category → get parent_id
+        _FakeResp(parent_page),       # Call 4: parent category products
+    ])
+
+    with patch("backend.modules.catalog.service.httpx.AsyncClient", side_effect=mock):
+        async with client as ac:
+            resp = await ac.get(
+                f"/api/v1/catalog/products/{PRODUCT_ID}/similar",
+                params={"limit": 5},
+            )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert isinstance(data, list)
+    assert len(data) == 5  # capped at limit
+
+    # All results must be from the known pool (primary + parent), not the current product
+    known_ids = {p["id"] for p in primary_items + parent_items}
+    for item in data:
+        assert item["id"] in known_ids, f"Unknown id {item['id']} in result"
+        assert item["id"] != PRODUCT_ID
+
+
+@pytest.mark.asyncio
+async def test_similar_fallback_no_parent_returns_primary_results(client):
+    """
+    When category has no parent (root category), fallback is skipped.
+    B2C returns whatever it found in the primary category.
+    """
+    product = _make_b2b_product_detail(product_id=PRODUCT_ID, category_id=CATEGORY_ID)
+
+    primary_items = [_make_b2b_short_product(title=f"P{i}") for i in range(3)]
+    primary_page = _b2b_catalog_page(primary_items)
+
+    # Category detail: parent_id = None (root category)
+    category_detail = _make_b2b_category(category_id=CATEGORY_ID, parent_id=None)
+
+    mock = _SequenceMockClient([
+        _FakeResp(product),
+        _FakeResp(primary_page),
+        _FakeResp(category_detail),  # parent_id=None → fallback skipped
+    ])
+
+    with patch("backend.modules.catalog.service.httpx.AsyncClient", side_effect=mock):
+        async with client as ac:
+            resp = await ac.get(
+                f"/api/v1/catalog/products/{PRODUCT_ID}/similar",
+                params={"limit": 10},
+            )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert len(data) == 3  # only primary results; no phantom items
+
+
+@pytest.mark.asyncio
+async def test_similar_fallback_deduplicates_across_categories(client):
+    """
+    If a product appears in both the primary and parent category response,
+    it must appear only once in the result.
+    """
+    product = _make_b2b_product_detail(product_id=PRODUCT_ID, category_id=CATEGORY_ID)
+    shared_id = str(uuid4())
+
+    # Same product appears in both primary and parent category results
+    primary_items = [_make_b2b_short_product(product_id=shared_id, title="Shared Product")]
+    primary_page = _b2b_catalog_page(primary_items)
+
+    category_detail = _make_b2b_category(category_id=CATEGORY_ID, parent_id=PARENT_CATEGORY_ID)
+
+    parent_items = [
+        _make_b2b_short_product(product_id=shared_id, title="Shared Product"),  # duplicate
+        _make_b2b_short_product(title="Unique Parent Product"),
+    ]
+    parent_page = _b2b_catalog_page(parent_items)
+
+    mock = _SequenceMockClient([
+        _FakeResp(product),
+        _FakeResp(primary_page),
+        _FakeResp(category_detail),
+        _FakeResp(parent_page),
+    ])
+
+    with patch("backend.modules.catalog.service.httpx.AsyncClient", side_effect=mock):
+        async with client as ac:
+            resp = await ac.get(
+                f"/api/v1/catalog/products/{PRODUCT_ID}/similar",
+                params={"limit": 10},
+            )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    result_ids = [item["id"] for item in data]
+    assert len(result_ids) == len(set(result_ids)), "Duplicate product in similar results"
+    assert shared_id in result_ids
