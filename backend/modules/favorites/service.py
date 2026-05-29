@@ -28,7 +28,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.modules.catalog.schemas import CatalogProductCard, ImageRef
+from backend.modules.catalog.schemas import CatalogProductCard, CategoryRef, ImageRef, SellerRef
 from backend.modules.catalog.service import _make_image_ref, _b2b_sku_to_catalog
 from backend.modules.favorites.models import Favorite
 from backend.modules.favorites.schemas import FavoritesListResponse
@@ -63,15 +63,20 @@ def _b2b_full_to_card(data: dict[str, Any]) -> CatalogProductCard:
         for img in raw_images
     ]
 
+    cat_id = data.get("category_id")
+    category = CategoryRef(id=UUID(cat_id), name="", level=0, path=[]) if cat_id else None
+    seller_id = data.get("seller_id")
+    seller = SellerRef(id=UUID(seller_id), display_name="") if seller_id else None
+
     return CatalogProductCard(
         id=UUID(data["id"]),
         name=data["title"],
         slug=data.get("slug"),
-        category_id=UUID(data["category_id"]) if data.get("category_id") else None,
+        category=category,
         min_price=min_price,
         has_stock=has_stock,
         images=images,
-        seller_id=UUID(data["seller_id"]) if data.get("seller_id") else None,
+        seller=seller,
     )
 
 

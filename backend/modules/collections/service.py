@@ -30,7 +30,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import B2B_BASE_URL, B2C_TO_B2B_KEY
-from backend.modules.catalog.schemas import CatalogProductCard, ImageRef
+from backend.modules.catalog.schemas import CatalogProductCard, CategoryRef, ImageRef, SellerRef
 from backend.modules.collections.models import Collection, CollectionProduct
 from backend.modules.collections.schemas import (
     CollectionMeta,
@@ -90,15 +90,20 @@ def _b2b_to_catalog_card(data: dict[str, Any]) -> CatalogProductCard:
         if isinstance(img, dict) and img.get("url")
     ]
 
+    cat_id = data.get("category_id")
+    category = CategoryRef(id=UUID(cat_id), name="", level=0, path=[]) if cat_id else None
+    seller_id = data.get("seller_id")
+    seller = SellerRef(id=UUID(seller_id), display_name="") if seller_id else None
+
     return CatalogProductCard(
         id=UUID(data["id"]),
         name=data.get("title", ""),
         slug=data.get("slug"),
-        category_id=UUID(data["category_id"]) if data.get("category_id") else None,
+        category=category,
         min_price=max(0, min_price),
         has_stock=has_stock,
         images=images,
-        seller_id=UUID(data["seller_id"]) if data.get("seller_id") else None,
+        seller=seller,
     )
 
 
@@ -107,16 +112,27 @@ def _b2b_to_catalog_card(data: dict[str, Any]) -> CatalogProductCard:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+# spec b2c/openapi.yaml#Collection requires products[] populated in list response.
+# We limit to this many products per collection to keep the list endpoint fast.
+_COLLECTION_PREVIEW_LIMIT = 10
+
+
 class CollectionsService:
     @staticmethod
-    async def list_collections(db: AsyncSession) -> list[CollectionMeta]:
+    async def list_collections(
+        db: AsyncSession,
+        b2b_base_url: str = B2B_BASE_URL,
+        service_key: str = B2C_TO_B2B_KEY,
+    ) -> list[CollectionMeta]:
         """
-        Return active collections sorted by priority ASC.
+        Return active collections sorted by priority ASC, with products enriched
+        from B2B (up to COLLECTION_PREVIEW_LIMIT per collection).
 
         Filter: is_active=True AND (start_date IS NULL OR start_date <= today())
-        Returns metadata only — products[] is always empty in list view.
+        One B2B batch call covers all product_ids across all collections.
 
         Spec: GET /api/v1/catalog/collections → array of Collection.
+        b2c/openapi.yaml#Collection required: [id, name, products]
         """
         today = date.today()
         result = await db.execute(
@@ -128,15 +144,43 @@ class CollectionsService:
             .order_by(Collection.priority.asc())
         )
         rows = result.scalars().all()
-        return [
-            CollectionMeta(
+        if not rows:
+            return []
+
+        # Load product_ids per collection (limited to preview count)
+        col_product_ids: dict[UUID, list[UUID]] = {}
+        for row in rows:
+            pid_result = await db.execute(
+                select(CollectionProduct.product_id)
+                .where(CollectionProduct.collection_id == row.id)
+                .order_by(CollectionProduct.ordering.asc())
+                .limit(_COLLECTION_PREVIEW_LIMIT)
+            )
+            col_product_ids[row.id] = [r[0] for r in pid_result.all()]
+
+        # One batch call for all unique product_ids across all collections
+        all_pids = list(
+            {pid for pids in col_product_ids.values() for pid in pids}
+        )
+        b2b_products = await _batch_fetch_products(all_pids, b2b_base_url, service_key)
+
+        # Build response, preserving per-collection ordering
+        output: list[CollectionMeta] = []
+        for row in rows:
+            pids = col_product_ids.get(row.id, [])
+            products: list[CatalogProductCard] = []
+            for pid in pids:
+                data = b2b_products.get(str(pid))
+                if data is not None:
+                    products.append(_b2b_to_catalog_card(data))
+            output.append(CollectionMeta(
                 id=row.id,
                 name=row.name,
                 description=row.description,
-                products=[],   # metadata-only in list view
-            )
-            for row in rows
-        ]
+                products=products,
+            ))
+
+        return output
 
     @staticmethod
     async def get_collection_products(

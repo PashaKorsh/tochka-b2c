@@ -45,7 +45,7 @@ def _upstream_error(exc: Exception) -> HTTPException:
 @router.get(
     "/catalog/collections",
     response_model=List[CollectionMeta],
-    summary="List active collections (home page)",
+    summary="List active collections with products (home page)",
 )
 async def list_collections(
     db: AsyncSession = Depends(get_db),
@@ -54,12 +54,15 @@ async def list_collections(
     Public endpoint — no auth required.
 
     Returns active collections sorted by priority ASC.
-    products[] is always empty in the list response (metadata only).
-    Use GET /catalog/collections/{id}/products for enriched product data.
+    Each collection's products[] is populated with up to 10 items enriched from B2B
+    (spec b2c/openapi.yaml#Collection required: [id, name, products]).
 
     Spec: b2c/openapi.yaml /api/v1/catalog/collections
     """
-    return await CollectionsService.list_collections(db)
+    try:
+        return await CollectionsService.list_collections(db)
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise _upstream_error(exc)
 
 
 @router.get(

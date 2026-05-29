@@ -141,20 +141,21 @@ def _b2b_product(product_id: UUID, title: str = "Test Product") -> dict:
 async def test_collections_list_returns_metadata_without_products():
     """
     GET /api/v1/catalog/collections returns a bare array of Collection objects.
-    Each item has metadata fields (id, name, description) but products: [].
 
     Verifies:
-    - 200 status
-    - Response is a JSON array (not wrapped in {items, total_count})
-    - products field is [] — no product data in list view (metadata-only)
-    - Inactive collections are excluded
-    - Collections sorted by priority ASC
-    """
-    product_id = uuid4()
+    - 200 status, bare array (spec)
+    - Required fields: id, name, products present per spec b2c/openapi.yaml#Collection
+    - Inactive collections excluded
+    - Sorted by priority ASC
+    - Collections without product_ids return products=[]
 
+    Note: product enrichment for non-empty collections is tested in
+    test_collections_list_populates_products_from_b2b.
+    """
     async for db in _db_session():
+        # Seed without product_ids → products=[] without B2B call
         coll_a = await _seed_collection(
-            db, name="Summer Sale", priority=5, product_ids=[product_id]
+            db, name="Summer Sale", priority=5, product_ids=[]
         )
         coll_b = await _seed_collection(
             db, name="New Arrivals", priority=2, product_ids=[]
@@ -163,10 +164,13 @@ async def test_collections_list_returns_metadata_without_products():
             db, name="INACTIVE", priority=1, is_active=False
         )
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.get("/api/v1/catalog/collections")
+    # Mock B2B: return empty list for any products (DB may have collections from other tests)
+    mock = _MockClient(_FakeResp([]))
+    with patch("backend.modules.collections.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/catalog/collections")
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
@@ -175,26 +179,81 @@ async def test_collections_list_returns_metadata_without_products():
     assert isinstance(body, list), "Spec: response must be a bare array"
 
     returned_ids = [item["id"] for item in body]
-    assert str(coll_a.id) in returned_ids, "Active collection A must appear"
-    assert str(coll_b.id) in returned_ids, "Active collection B must appear"
-    assert str(coll_inactive.id) not in returned_ids, "Inactive collection must be excluded"
+    assert str(coll_a.id) in returned_ids
+    assert str(coll_b.id) in returned_ids
+    assert str(coll_inactive.id) not in returned_ids
 
-    # Metadata-only: products must be empty in list view
-    for item in body:
-        assert "products" in item
-        assert item["products"] == [], "products must be empty in list view (metadata only)"
-
-    # Required spec fields
+    # spec b2c/openapi.yaml#Collection required: [id, name, products]
     for item in body:
         assert "id" in item
         assert "name" in item
+        assert "products" in item
+
+    # Our new collections have no product_ids → products=[]
+    for item in body:
+        if item["id"] in (str(coll_a.id), str(coll_b.id)):
+            assert item["products"] == [], "Collection with no product_ids must have products=[]"
 
     # Sorted by priority ASC
     active_items = [i for i in body if i["id"] in (str(coll_a.id), str(coll_b.id))]
-    # coll_b has priority=2, coll_a has priority=5 → B first
     first_idx = next(i for i, x in enumerate(active_items) if x["id"] == str(coll_b.id))
     second_idx = next(i for i, x in enumerate(active_items) if x["id"] == str(coll_a.id))
-    assert first_idx < second_idx, "Lower priority value (2) comes before higher (5)"
+    assert first_idx < second_idx, "Lower priority (2) before higher (5)"
+
+
+@pytest.mark.asyncio
+async def test_collections_list_populates_products_from_b2b():
+    """
+    spec b2c/openapi.yaml#Collection required: [id, name, products] — products must
+    be populated from B2B in the list response.
+
+    Verifies:
+    - products[] contains CatalogProductCard items (not empty)
+    - Each card has required fields: id, name, min_price, has_stock, images
+    - Products absent from B2B (blocked/deleted) are silently excluded
+    """
+    pid1 = uuid4()
+    pid2 = uuid4()
+
+    async for db in _db_session():
+        coll = await _seed_collection(
+            db, name="Featured", priority=1, product_ids=[pid1, pid2]
+        )
+
+    b2b_resp = _FakeResp([
+        _b2b_product(pid1, "Card A"),
+        _b2b_product(pid2, "Card B"),
+    ])
+
+    mock = _MockClient(b2b_resp)
+    with patch(
+        "backend.modules.collections.service.httpx.AsyncClient",
+        side_effect=mock,
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/catalog/collections")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    coll_item = next((x for x in body if x["id"] == str(coll.id)), None)
+    assert coll_item is not None
+
+    products = coll_item["products"]
+    assert isinstance(products, list)
+    assert len(products) == 2
+
+    for card in products:
+        assert "id" in card
+        assert "name" in card
+        assert "min_price" in card
+        assert "has_stock" in card
+        assert "images" in card
+        # spec: category is an object not a flat category_id UUID
+        assert "category_id" not in card, "category must be an object, not flat UUID"
+        assert "seller_id" not in card, "seller must be an object, not flat UUID"
 
 
 @pytest.mark.asyncio
@@ -389,11 +448,14 @@ async def test_future_collection_excluded_from_list():
             is_active=True, start_date=future_date,
         )
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.get("/api/v1/catalog/collections")
+    mock = _MockClient(_FakeResp([]))
+    with patch("backend.modules.collections.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/catalog/collections")
 
+    assert resp.status_code == 200
     returned_ids = {item["id"] for item in resp.json()}
     assert str(coll.id) not in returned_ids, "Future-dated collection must be excluded"
 
@@ -407,10 +469,12 @@ async def test_no_active_collections_returns_200_empty_array():
     async for db in _db_session():
         await _seed_collection(db, name="Disabled A", priority=1, is_active=False)
 
-    async with AsyncClient(
-        transport=ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        resp = await client.get("/api/v1/catalog/collections")
+    mock = _MockClient(_FakeResp([]))
+    with patch("backend.modules.collections.service.httpx.AsyncClient", side_effect=mock):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            resp = await client.get("/api/v1/catalog/collections")
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
