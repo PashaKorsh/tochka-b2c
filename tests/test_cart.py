@@ -707,3 +707,251 @@ async def test_deleted_product_shown_as_unavailable_in_cart():
     assert item["is_available"] is False
     assert item["unavailable_reason"] == "PRODUCT_DELETED"
     assert body["is_valid"] is False
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# POST /api/v1/cart/validate (US-B2C-08 addition)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def _validate_product_resp(product_id, sku_id, price=1000, discount=0, active_qty=5):
+    """ProductPublicResponse used in validate mock (same shape as batch endpoint)."""
+    return _FakeResp([{
+        "id": str(product_id),
+        "title": "Test Product",
+        "slug": "test",
+        "category_id": str(uuid4()),
+        "seller_id": str(uuid4()),
+        "images": [],
+        "skus": [{
+            "id": str(sku_id),
+            "name": "SKU",
+            "article": "ART",
+            "price": price,
+            "discount": discount,
+            "active_quantity": active_qty,
+            "images": [],
+        }],
+    }])
+
+
+@pytest.mark.asyncio
+async def test_validate_cart_valid():
+    """
+    Happy path: all items in stock, prices unchanged → is_valid=True, issues=[].
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    # Add item at price 1000
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, price=1000, discount=0, active_qty=5),
+        _product_resp(product_id, sku_id, price=1000, discount=0, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            r = await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 2})
+    assert r.status_code == 200
+
+    # Validate — price still 1000, qty=5 >= requested 2
+    mock_validate = _MockClient(_validate_product_resp(product_id, sku_id, price=1000, active_qty=5))
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["is_valid"] is True
+    assert body["issues"] == []
+    assert "cart" in body
+    assert body["cart"]["is_valid"] is True
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_price_changed():
+    """
+    PRICE_CHANGED issue: B2B price differs from unit_price_snapshot stored at add time.
+    old_value = price at add, new_value = current price.
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    # Add item at price 1000
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, price=1000, discount=0, active_qty=5),
+        _product_resp(product_id, sku_id, price=1000, discount=0, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 1})
+
+    # Validate — price is now 1200 (raised)
+    mock_validate = _MockClient(_validate_product_resp(product_id, sku_id, price=1200, active_qty=5))
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_valid"] is False
+    issue = next((i for i in body["issues"] if i["type"] == "PRICE_CHANGED"), None)
+    assert issue is not None, "Expected PRICE_CHANGED issue"
+    assert issue["sku_id"] == str(sku_id)
+    assert issue["old_value"] == 1000
+    assert issue["new_value"] == 1200
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_out_of_stock():
+    """
+    OUT_OF_STOCK issue: active_quantity == 0 after item was added.
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, active_qty=5),
+        _product_resp(product_id, sku_id, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 1})
+
+    # Validate — now out of stock
+    mock_validate = _MockClient(_validate_product_resp(product_id, sku_id, active_qty=0))
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_valid"] is False
+    issue = next((i for i in body["issues"] if i["type"] == "OUT_OF_STOCK"), None)
+    assert issue is not None
+    assert issue["sku_id"] == str(sku_id)
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_quantity_reduced():
+    """
+    QUANTITY_REDUCED issue: 0 < active_quantity < requested quantity.
+    old_value = requested qty, new_value = available qty.
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, active_qty=5),
+        _product_resp(product_id, sku_id, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 4})
+
+    # Validate — only 2 available now (less than requested 4)
+    mock_validate = _MockClient(_validate_product_resp(product_id, sku_id, active_qty=2))
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_valid"] is False
+    issue = next((i for i in body["issues"] if i["type"] == "QUANTITY_REDUCED"), None)
+    assert issue is not None
+    assert issue["old_value"] == 4
+    assert issue["new_value"] == 2
+
+
+@pytest.mark.asyncio
+async def test_validate_detects_product_deleted():
+    """
+    PRODUCT_DELETED issue: product absent from B2B batch response.
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, active_qty=5),
+        _product_resp(product_id, sku_id, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 1})
+
+    # Validate — product gone from B2B
+    mock_validate = _MockClient(_FakeResp([]))  # empty batch response
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_valid"] is False
+    issue = next((i for i in body["issues"] if i["type"] == "PRODUCT_DELETED"), None)
+    assert issue is not None
+    assert issue["sku_id"] == str(sku_id)
+
+
+@pytest.mark.asyncio
+async def test_validate_empty_cart_is_valid():
+    """Empty cart → is_valid=True, issues=[], no B2B call needed."""
+    user_id = uuid4()
+    async with _make_client(user_id=user_id) as client:
+        resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_valid"] is True
+    assert body["issues"] == []
+    assert body["cart"]["items"] == []
+
+
+@pytest.mark.asyncio
+async def test_validate_response_shape():
+    """
+    spec b2c/openapi.yaml#CartValidationResponse required: [is_valid, cart, issues].
+    spec b2c/openapi.yaml#CartValidationIssue required: [sku_id, type, message].
+    """
+    user_id = uuid4()
+    sku_id = uuid4()
+    product_id = uuid4()
+
+    mock_add = _MockClient(
+        _sku_resp(sku_id, product_id, price=500, active_qty=5),
+        _product_resp(product_id, sku_id, price=500, active_qty=5),
+    )
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_add):
+        async with _make_client(user_id=user_id) as client:
+            await client.post("/api/v1/cart/items", json={"sku_id": str(sku_id), "quantity": 1})
+
+    # Price changed
+    mock_validate = _MockClient(_validate_product_resp(product_id, sku_id, price=700, active_qty=5))
+    with patch("backend.modules.cart.service.httpx.AsyncClient", side_effect=mock_validate):
+        async with _make_client(user_id=user_id) as client:
+            resp = await client.post("/api/v1/cart/validate")
+
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Top-level required fields
+    assert "is_valid" in body
+    assert "cart" in body
+    assert "issues" in body
+    assert isinstance(body["is_valid"], bool)
+    assert isinstance(body["issues"], list)
+
+    # Issue required fields
+    issue = body["issues"][0]
+    assert "sku_id" in issue
+    assert "type" in issue
+    assert "message" in issue
+    assert issue["type"] in [
+        "PRICE_CHANGED", "OUT_OF_STOCK", "QUANTITY_REDUCED",
+        "PRODUCT_BLOCKED", "PRODUCT_DELETED",
+    ]

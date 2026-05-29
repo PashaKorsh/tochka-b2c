@@ -18,6 +18,8 @@ from datetime import datetime
 from typing import List, Optional
 from uuid import UUID
 
+from enum import Enum
+
 from pydantic import BaseModel, Field
 
 
@@ -86,3 +88,42 @@ class CartResponseSchema(BaseModel):
     subtotal: int           # sum of line_total (available items only), kopecks
     is_valid: bool          # True if all items are available
     updated_at: Optional[datetime] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Validation schemas (POST /api/v1/cart/validate)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+class CartValidationIssueType(str, Enum):
+    """
+    spec b2c/openapi.yaml:1211 — CartValidationIssue.type enum.
+    Values are dословно из спеки — не переименовывать.
+    """
+    PRICE_CHANGED = "PRICE_CHANGED"
+    OUT_OF_STOCK = "OUT_OF_STOCK"
+    QUANTITY_REDUCED = "QUANTITY_REDUCED"
+    PRODUCT_BLOCKED = "PRODUCT_BLOCKED"
+    PRODUCT_DELETED = "PRODUCT_DELETED"
+
+
+class CartValidationIssue(BaseModel):
+    """
+    spec b2c/openapi.yaml#CartValidationIssue
+    required: [sku_id, type, message]
+    """
+    sku_id: UUID
+    type: CartValidationIssueType
+    message: str
+    old_value: Optional[int] = None   # e.g. old price or old quantity
+    new_value: Optional[int] = None   # e.g. new price or available quantity
+
+
+class CartValidationResponse(BaseModel):
+    """
+    spec b2c/openapi.yaml#CartValidationResponse
+    required: [is_valid, cart, issues]
+    """
+    is_valid: bool
+    cart: CartResponseSchema
+    issues: List[CartValidationIssue] = Field(default_factory=list)

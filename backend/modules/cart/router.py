@@ -41,6 +41,7 @@ from backend.modules.cart.schemas import (
     CartItemAddRequest,
     CartItemUpdateRequest,
     CartResponseSchema,
+    CartValidationResponse,
 )
 from backend.modules.cart.service import CartService
 
@@ -231,6 +232,34 @@ async def clear_cart(
     user_id, session_id = identity
     await CartService.clear_cart(db, user_id=user_id, session_id=session_id)
     return Response(status_code=204)
+
+
+@router.post("/cart/validate", response_model=CartValidationResponse)
+async def validate_cart(
+    identity: tuple = Depends(_get_cart_identity),
+    db: AsyncSession = Depends(get_db),
+) -> CartValidationResponse:
+    """
+    POST /api/v1/cart/validate — validate cart before checkout.
+
+    spec b2c/openapi.yaml:503-521
+
+    Returns CartValidationResponse {is_valid, cart, issues[]} where each issue has:
+      type: PRICE_CHANGED | OUT_OF_STOCK | QUANTITY_REDUCED | PRODUCT_BLOCKED | PRODUCT_DELETED
+      sku_id, message, old_value?, new_value?
+
+    Use this endpoint before showing the checkout screen. If is_valid=false, show
+    issues to the user and update the cart accordingly before POST /orders.
+    """
+    user_id, session_id = identity
+    try:
+        return await CartService.validate_cart(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+        )
+    except (httpx.ConnectError, httpx.TimeoutException, httpx.NetworkError) as exc:
+        raise _upstream_error(exc)
 
 
 @router.post("/cart/merge", response_model=CartResponseSchema)

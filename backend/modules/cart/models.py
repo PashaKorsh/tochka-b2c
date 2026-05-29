@@ -46,6 +46,9 @@ class CartItem(Base):
     # Set by US-B2C-12 (handle B2B events): PRODUCT_BLOCKED, PRODUCT_HARD_BLOCKED,
     # PRODUCT_DELETED, OUT_OF_STOCK. NULL = item is available.
     unavailable_reason = Column(Text, nullable=True, default=None)
+    # Snapshot of effective unit price (kopecks) at the time the item was added.
+    # Used by POST /cart/validate to detect PRICE_CHANGED. NULL for old rows.
+    unit_price_snapshot = Column(Integer, nullable=True, default=None)
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
