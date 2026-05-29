@@ -1,25 +1,16 @@
 """
-Order and OrderItem models — US-B2C-09 / US-B2C-10 / US-B2C-13.
+Order and OrderItem models — US-B2C-09 / US-B2C-10 / US-B2C-11 / US-B2C-13.
 
-Architecture decisions:
-  - idempotency_key is a UNIQUE column on orders — DB enforces race-safety atomically.
-    Two concurrent POSTs with the same key: one wins INSERT, the other catches
-    IntegrityError and reads the committed row. No separate cache table needed.
-  - status starts at PAID immediately (mock payment — no real payment gateway).
-  - unit_price / line_total are integer cents (snapshot at checkout time).
-  - delivery_address is a TEXT snapshot (freeform) — no FK to an address table
-    because B2C does not have an address registry yet.
-    Spec deviation: spec.OrderResponse.address is AddressResponse (structured object);
-    current impl keeps it as a string until the address-book service is built.
-  - payment_method_id stored as UUID for future integration; payment is mocked.
-  - updated_at tracks the last status transition (PAID→ASSEMBLING→…).
-  - fulfill_completed_at (US-B2C-13): set when B2B POST /inventory/fulfill succeeds.
-    NULL = fulfill not yet sent or previously failed (retry eligible).
-    Non-NULL = fulfill acknowledged by B2B — skip on repeated deliver calls.
-
-Canon: b2c-cart-flows.md#b2c-09-checkout, b2c-orders-flows.md#b2c-10-view-orders,
-       b2c-orders-flows.md#b2c-13-fulfill
-Spec:  b2c/openapi.yaml — OrderResponse, OrderItem, PaginatedOrders
+Checkout flow (spec b2c/openapi.yaml):
+  - Items come from the buyer's active cart (not from request body).
+  - address_id references a saved buyer address (addresses table).
+  - Address data is snapshotted as JSON into address_snapshot at checkout time,
+    so subsequent address edits don't retroactively change order history.
+  - payment_method_id is stored as UUID (mock payment — no real gateway).
+  - status starts at PAID immediately.
+  - idempotency_key enforced as UNIQUE to prevent double-checkout.
+  - unit_price / line_total in OrderItem are fixed at checkout time.
+  - fulfill_completed_at (US-B2C-13): set when B2B inventory/fulfill succeeds.
 """
 import uuid
 from datetime import datetime, timezone
@@ -33,18 +24,21 @@ from backend.database import Base
 class Order(Base):
     __tablename__ = "orders"
 
-    id = Column(
-        PG_UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
+    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     buyer_id = Column(PG_UUID(as_uuid=True), nullable=False)
     idempotency_key = Column(String(255), nullable=False, unique=True)
     status = Column(String(32), nullable=False, default="PAID")
-    delivery_address = Column(Text, nullable=False)
-    payment_method_id = Column(PG_UUID(as_uuid=True), nullable=True)
-    subtotal = Column(Integer, nullable=False)  # sum of line_totals, in cents
+
+    # Address: reference + JSON snapshot (prevents edits from affecting history)
+    address_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    address_snapshot = Column(Text, nullable=False, default="{}")  # JSON
+
+    payment_method_id = Column(PG_UUID(as_uuid=True), nullable=False)
+    comment = Column(Text, nullable=True)
+
+    subtotal = Column(Integer, nullable=False)  # sum of line_totals, kopecks
     total = Column(Integer, nullable=False)     # same as subtotal (no extra fees yet)
+
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -57,12 +51,7 @@ class Order(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
     # US-B2C-13: set when B2B inventory/fulfill is successfully acknowledged.
-    # NULL = not yet sent or last attempt failed (eligible for retry).
-    fulfill_completed_at = Column(
-        DateTime(timezone=True),
-        nullable=True,
-        default=None,
-    )
+    fulfill_completed_at = Column(DateTime(timezone=True), nullable=True, default=None)
 
     __table_args__ = (
         Index("idx_orders_buyer_created", "buyer_id", "created_at"),
@@ -72,11 +61,7 @@ class Order(Base):
 class OrderItem(Base):
     __tablename__ = "order_items"
 
-    id = Column(
-        PG_UUID(as_uuid=True),
-        primary_key=True,
-        default=uuid.uuid4,
-    )
+    id = Column(PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     order_id = Column(
         PG_UUID(as_uuid=True),
         ForeignKey("orders.id", ondelete="CASCADE"),
@@ -84,10 +69,10 @@ class OrderItem(Base):
     )
     sku_id = Column(PG_UUID(as_uuid=True), nullable=False)
     product_id = Column(PG_UUID(as_uuid=True), nullable=False)
-    name = Column(String(512), nullable=False)   # price-snapshot title (product + sku name)
+    name = Column(String(512), nullable=False)
     quantity = Column(Integer, nullable=False)
-    unit_price = Column(Integer, nullable=False)  # effective price at checkout (cents)
-    line_total = Column(Integer, nullable=False)  # unit_price * quantity
+    unit_price = Column(Integer, nullable=False)  # effective price at checkout, kopecks
+    line_total = Column(Integer, nullable=False)   # unit_price * quantity
 
     __table_args__ = (
         Index("idx_order_items_order", "order_id"),

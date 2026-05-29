@@ -23,20 +23,24 @@ Architecture:
 
 Checkout flow (canon §enrichment, adapted):
   1. Check idempotency_key in DB → return existing order if found.
-  2. Validate items: GET /api/v1/public/skus/{sku_id} per item (B2B).
-     - Raises ValueError("SKU_NOT_FOUND:{sku_id}") if SKU absent from B2B.
-  3. Build price snapshot: unit_price = sku.price - sku.discount (≥ 0).
-  4. Pre-generate order_id (UUID4).
-  5. POST /api/v1/inventory/reserve {idempotency_key, order_id, items}.
+  2. Validate address via AddressService.get_address → ADDRESS_NOT_FOUND if None.
+  3. Read cart items WHERE user_id=buyer_id → CART_EMPTY if no items.
+  4. Enrich cart items via POST /api/v1/public/products/batch.
+     - Raises ValueError("CART_HAS_UNAVAILABLE_ITEMS") if any item is unavailable.
+  5. Build price snapshot from enriched B2B data.
+  6. Pre-generate order_id (UUID4).
+  7. POST /api/v1/inventory/reserve {idempotency_key, order_id, items}.
      - B2B 4xx → ValueError("RESERVE_FAILED:{body}").
      - httpx connection/timeout error → re-raised as httpx.ConnectError / TimeoutException.
-  6. Insert Order + OrderItems in one transaction.
-  7. On IntegrityError (race on idempotency_key) → read and return the winner's row.
+  8. Insert Order + OrderItems in one transaction.
+  9. Clear cart (DELETE FROM cart_items WHERE user_id=buyer_id).
+  10. On IntegrityError (race on idempotency_key) → read and return the winner's row.
 
 Status is immediately PAID (mock payment — no real gateway).
 """
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -44,13 +48,16 @@ from typing import Any
 from uuid import UUID
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.config import B2B_BASE_URL, B2C_TO_B2B_KEY
 
 logger = logging.getLogger(__name__)
+from backend.modules.addresses.schemas import AddressResponse
+from backend.modules.addresses.service import AddressService
+from backend.modules.cart.models import CartItem
 from backend.modules.orders.models import Order, OrderItem
 from backend.modules.orders.schemas import (
     OrderCreateRequest,
@@ -58,6 +65,7 @@ from backend.modules.orders.schemas import (
     OrderResponse,
     OrderStatus,
     PaginatedOrdersResponse,
+    PaymentMethodResponse,
 )
 
 
@@ -66,25 +74,29 @@ from backend.modules.orders.schemas import (
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-async def _fetch_sku(
-    sku_id: UUID,
+async def _batch_fetch_products_for_cart(
+    product_ids: list[UUID],
     b2b_base_url: str,
     service_key: str,
-) -> dict[str, Any]:
+) -> dict[str, dict[str, Any]]:
     """
-    GET /api/v1/public/skus/{sku_id} → SKUPublicResponse dict.
-    Returns only MODERATED SKUs with active_quantity > 0.
-    Raises ValueError("SKU_NOT_FOUND:...") on 404.
+    POST /api/v1/public/products/batch → map of product_id → ProductPublicResponse.
+
+    B2B only returns available products (MODERATED, not deleted, active_quantity > 0).
+    Missing IDs are absent — treated as unavailable at checkout.
+
+    Raises:
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 503.
     """
     async with httpx.AsyncClient(timeout=10.0) as client:
-        resp = await client.get(
-            f"{b2b_base_url}/api/v1/public/skus/{sku_id}",
+        resp = await client.post(
+            f"{b2b_base_url}/api/v1/public/products/batch",
+            json={"product_ids": [str(pid) for pid in product_ids]},
             headers={"X-Service-Key": service_key},
         )
-    if resp.status_code == 404:
-        raise ValueError(f"SKU_NOT_FOUND:{sku_id}")
     resp.raise_for_status()
-    return resp.json()
+    items: list[dict[str, Any]] = resp.json()
+    return {item["id"]: item for item in items}
 
 
 async def _reserve(
@@ -171,12 +183,48 @@ async def _unreserve(
 # ──────────────────────────────────────────────────────────────────────────────
 
 
+def _build_address_response(address_snapshot: str | None) -> AddressResponse:
+    """
+    Parse address_snapshot JSON → AddressResponse.
+
+    Handles empty/missing snapshots gracefully by providing placeholder defaults.
+    In practice, address_snapshot should always be a valid JSON object stored at
+    checkout time; defaults are a safety net for legacy rows or test seeds.
+    """
+    data: dict[str, Any] = {}
+    if address_snapshot:
+        try:
+            data = json.loads(address_snapshot)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Provide defaults for required AddressResponse fields if snapshot is incomplete
+    if not data.get("id"):
+        data["id"] = str(uuid.UUID(int=0))
+    if not data.get("created_at"):
+        data["created_at"] = datetime.now(timezone.utc).isoformat()
+    if not data.get("country"):
+        data["country"] = ""
+    if not data.get("city"):
+        data["city"] = ""
+    if not data.get("street"):
+        data["street"] = ""
+    if not data.get("building"):
+        data["building"] = ""
+
+    return AddressResponse(**data)
+
+
 async def _load_order(db: AsyncSession, order: Order) -> OrderResponse:
     """Load OrderItems for `order` and build OrderResponse."""
     items_result = await db.execute(
         select(OrderItem).where(OrderItem.order_id == order.id)
     )
     db_items = items_result.scalars().all()
+
+    address = _build_address_response(order.address_snapshot)
+    payment_method = PaymentMethodResponse(id=order.payment_method_id, type="CARD")
+
     return OrderResponse(
         id=order.id,
         buyer_id=order.buyer_id,
@@ -194,7 +242,9 @@ async def _load_order(db: AsyncSession, order: Order) -> OrderResponse:
         ],
         subtotal=order.subtotal,
         total=order.total,
-        address=order.delivery_address,
+        address=address,
+        payment_method=payment_method,
+        comment=order.comment,
         created_at=order.created_at,
         updated_at=order.updated_at,
     )
@@ -220,6 +270,8 @@ async def _load_orders_bulk(
     responses = []
     for order in orders:
         order_items = items_map.get(order.id, [])
+        address = _build_address_response(order.address_snapshot)
+        payment_method = PaymentMethodResponse(id=order.payment_method_id, type="CARD")
         responses.append(
             OrderResponse(
                 id=order.id,
@@ -238,7 +290,9 @@ async def _load_orders_bulk(
                 ],
                 subtotal=order.subtotal,
                 total=order.total,
-                address=order.delivery_address,
+                address=address,
+                payment_method=payment_method,
+                comment=order.comment,
                 created_at=order.created_at,
                 updated_at=order.updated_at,
             )
@@ -272,14 +326,17 @@ class OrdersService:
         service_key: str = B2C_TO_B2B_KEY,
     ) -> tuple[OrderResponse, bool]:
         """
-        Create a new order or return an existing one for the same idempotency key.
+        Create a new order from the buyer's active cart, or return an existing
+        order for the same idempotency key.
 
         Returns:
           (order_response, is_new) where is_new=True → 201, is_new=False → 200.
 
         Raises:
-          ValueError("SKU_NOT_FOUND:...") → 404
-          ValueError("RESERVE_FAILED:...") → 409
+          ValueError("ADDRESS_NOT_FOUND")           → 404
+          ValueError("CART_EMPTY")                  → 422 / 400
+          ValueError("CART_HAS_UNAVAILABLE_ITEMS")  → 409
+          ValueError("RESERVE_FAILED:...")          → 409
           httpx errors (ConnectError, TimeoutException, …) → caller maps to 503
         """
         # Step 1 — idempotency check (fast path)
@@ -287,28 +344,66 @@ class OrdersService:
         if existing is not None:
             return await _load_order(db, existing), False
 
-        # Step 2 — validate SKUs and snapshot prices from B2B
+        # Step 2 — validate address (IDOR-safe: buyer_id is from JWT)
+        address = await AddressService.get_address(
+            db, buyer_id=buyer_id, address_id=payload.address_id
+        )
+        if address is None:
+            raise ValueError("ADDRESS_NOT_FOUND")
+
+        # Step 3 — read cart items for this buyer
+        cart_result = await db.execute(
+            select(CartItem).where(CartItem.user_id == buyer_id)
+        )
+        cart_items = list(cart_result.scalars().all())
+        if not cart_items:
+            raise ValueError("CART_EMPTY")
+
+        # Step 4 — check for already-marked unavailable items in cart
+        unavailable_cart = [ci for ci in cart_items if ci.unavailable_reason is not None]
+        if unavailable_cart:
+            raise ValueError("CART_HAS_UNAVAILABLE_ITEMS")
+
+        # Step 5 — enrich cart items via B2B batch endpoint
+        product_ids = list({ci.product_id for ci in cart_items})
+        b2b_products = await _batch_fetch_products_for_cart(
+            product_ids, b2b_base_url, service_key
+        )
+
+        # Step 6 — build enriched items; raise if any product is unavailable in B2B
         enriched: list[dict[str, Any]] = []
-        for req_item in payload.items:
-            sku_data = await _fetch_sku(req_item.sku_id, b2b_base_url, service_key)
+        for ci in cart_items:
+            product_data = b2b_products.get(str(ci.product_id))
+            if product_data is None:
+                raise ValueError("CART_HAS_UNAVAILABLE_ITEMS")
+
+            # Find the SKU in the product's SKU list to get price info
+            skus = product_data.get("skus", [])
+            sku_data = next(
+                (s for s in skus if str(s.get("id", "")) == str(ci.sku_id)),
+                None,
+            )
+            if sku_data is None or (sku_data.get("active_quantity") or 0) <= 0:
+                raise ValueError("CART_HAS_UNAVAILABLE_ITEMS")
+
             unit_price = max(
                 0,
                 (sku_data.get("price") or 0) - (sku_data.get("discount") or 0),
             )
             enriched.append(
                 {
-                    "sku_id": req_item.sku_id,
-                    "product_id": UUID(sku_data["product_id"]),
-                    "name": sku_data.get("name") or sku_data.get("title") or "",
-                    "quantity": req_item.quantity,
+                    "sku_id": ci.sku_id,
+                    "product_id": ci.product_id,
+                    "name": product_data.get("title") or product_data.get("name") or "",
+                    "quantity": ci.quantity,
                     "unit_price": unit_price,
-                    "line_total": unit_price * req_item.quantity,
+                    "line_total": unit_price * ci.quantity,
                 }
             )
 
         subtotal = sum(e["line_total"] for e in enriched)
 
-        # Step 3 — B2B all-or-nothing reserve
+        # Step 7 — B2B all-or-nothing reserve
         order_id = uuid.uuid4()
         reserve_items = [
             {"sku_id": str(e["sku_id"]), "quantity": e["quantity"]}
@@ -316,14 +411,17 @@ class OrdersService:
         ]
         await _reserve(idempotency_key, order_id, reserve_items, b2b_base_url, service_key)
 
-        # Step 4 — persist order
+        # Step 8 — persist order + items
+        address_snapshot = json.dumps(address.model_dump(mode="json"))
         order = Order(
             id=order_id,
             buyer_id=buyer_id,
             idempotency_key=idempotency_key,
             status=OrderStatus.PAID.value,
-            delivery_address=payload.delivery_address,
+            address_id=payload.address_id,
+            address_snapshot=address_snapshot,
             payment_method_id=payload.payment_method_id,
+            comment=payload.comment,
             subtotal=subtotal,
             total=subtotal,  # no extra fees (mock)
         )
@@ -351,6 +449,10 @@ class OrdersService:
             if winner is None:
                 raise  # should not happen, but don't swallow
             return await _load_order(db, winner), False
+
+        # Step 9 — clear cart after successful checkout
+        await db.execute(delete(CartItem).where(CartItem.user_id == buyer_id))
+        await db.commit()
 
         return await _load_order(db, order), True
 

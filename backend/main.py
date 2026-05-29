@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from backend.modules.addresses.router import router as addresses_router
 from backend.modules.catalog.router import router as catalog_router
 from backend.modules.favorites.router import router as favorites_router
 from backend.modules.subscriptions.router import router as subscriptions_router
@@ -82,6 +83,7 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 
 
 # ─────────────────────── Routers ───────────────────────
+app.include_router(addresses_router)
 app.include_router(catalog_router)
 app.include_router(favorites_router)
 app.include_router(subscriptions_router)

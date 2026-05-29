@@ -51,20 +51,29 @@ async def _seed_order(
     *,
     buyer_id: UUID,
     status: str = "DELIVERING",
-    delivery_address: str = "ул. Тестовая, 1",
     items: list[dict] | None = None,
 ) -> Order:
     """Insert Order + OrderItems directly (no B2B calls)."""
+    import json as _json
+    from datetime import datetime, timezone as _tz
     if items is None:
         items = [{"sku_id": uuid4(), "product_id": uuid4(), "name": "Item", "quantity": 2, "unit_price": 500, "line_total": 1000}]
 
+    addr_id = uuid4()
+    address_snapshot = _json.dumps({
+        "id": str(addr_id), "country": "RU", "city": "Москва",
+        "street": "Тестовая", "building": "1",
+        "created_at": datetime.now(_tz.utc).isoformat(),
+    })
     subtotal = sum(it["line_total"] for it in items)
     order = Order(
         id=uuid4(),
         buyer_id=buyer_id,
         idempotency_key=str(uuid4()),
         status=status,
-        delivery_address=delivery_address,
+        address_id=addr_id,
+        address_snapshot=address_snapshot,
+        payment_method_id=uuid4(),
         subtotal=subtotal,
         total=subtotal,
     )
