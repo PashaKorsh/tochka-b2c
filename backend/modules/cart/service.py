@@ -305,6 +305,9 @@ class CartService:
                 .values(quantity=new_qty, updated_at=datetime.now(timezone.utc))
             )
         else:
+            # Snapshot the effective price at add time for PRICE_CHANGED detection in validate
+            snap_price: int = sku_data.get("price", 0) or 0
+            snap_discount: int = sku_data.get("discount", 0) or 0
             db.add(
                 CartItem(
                     user_id=user_id,
@@ -312,6 +315,7 @@ class CartService:
                     sku_id=sku_id,
                     product_id=product_id,
                     quantity=quantity,
+                    unit_price_snapshot=max(0, snap_price - snap_discount),
                 )
             )
 
@@ -480,6 +484,124 @@ class CartService:
             b2b_base_url=b2b_base_url,
             service_key=service_key,
         )
+
+    @staticmethod
+    async def validate_cart(
+        db: AsyncSession,
+        *,
+        user_id: Optional[UUID],
+        session_id: Optional[str],
+        b2b_base_url: str = B2B_BASE_URL,
+        service_key: str = B2C_TO_B2B_KEY,
+    ) -> "CartValidationResponse":
+        """
+        Validate cart contents against live B2B data before checkout.
+
+        spec b2c/openapi.yaml:503-521 → POST /api/v1/cart/validate
+        Returns CartValidationResponse {is_valid, cart, issues[]}
+
+        Issue types detected (spec b2c/openapi.yaml:1211):
+          PRICE_CHANGED    — current B2B price differs from unit_price_snapshot stored at add time.
+          OUT_OF_STOCK     — active_quantity == 0 (or product absent + previous reason not BLOCKED).
+          QUANTITY_REDUCED — 0 < active_quantity < item.quantity (stock covers some, not all).
+          PRODUCT_BLOCKED  — unavailable_reason in DB == 'PRODUCT_BLOCKED' or 'PRODUCT_HARD_BLOCKED'.
+          PRODUCT_DELETED  — product absent from B2B response and not previously marked blocked.
+
+        Raises:
+          httpx.ConnectError / TimeoutException → caller maps to 502.
+        """
+        from backend.modules.cart.schemas import (
+            CartValidationIssue,
+            CartValidationIssueType,
+            CartValidationResponse,
+        )
+
+        # Build current enriched cart (used as the `cart` field in response)
+        rows = await _select_items(db, user_id, session_id)
+        if not rows:
+            empty_cart = CartResponseSchema(
+                items=[], items_count=0, subtotal=0, is_valid=True
+            )
+            return CartValidationResponse(is_valid=True, cart=empty_cart, issues=[])
+
+        product_ids = list({row.product_id for row in rows})
+        b2b_products = await _batch_fetch_products(product_ids, b2b_base_url, service_key)
+        cart = _build_cart_response(rows, b2b_products)
+
+        # Check each DB row against live B2B data
+        issues: list[CartValidationIssue] = []
+
+        for row in rows:
+            sku_id = row.sku_id
+            product_data = b2b_products.get(str(row.product_id))
+
+            # 1. Product absent from B2B → PRODUCT_BLOCKED or PRODUCT_DELETED
+            if product_data is None:
+                db_reason = (row.unavailable_reason or "").upper()
+                if "BLOCKED" in db_reason:
+                    issues.append(CartValidationIssue(
+                        sku_id=sku_id,
+                        type=CartValidationIssueType.PRODUCT_BLOCKED,
+                        message="Товар заблокирован и недоступен для заказа",
+                    ))
+                else:
+                    issues.append(CartValidationIssue(
+                        sku_id=sku_id,
+                        type=CartValidationIssueType.PRODUCT_DELETED,
+                        message="Товар удалён и недоступен для заказа",
+                    ))
+                continue
+
+            # Find the specific SKU in the product
+            skus: list[dict[str, Any]] = product_data.get("skus", [])
+            sku_data = next((s for s in skus if s.get("id") == str(sku_id)), None)
+
+            if sku_data is None:
+                issues.append(CartValidationIssue(
+                    sku_id=sku_id,
+                    type=CartValidationIssueType.PRODUCT_DELETED,
+                    message="SKU удалён из товара",
+                ))
+                continue
+
+            active_qty: int = sku_data.get("active_quantity", 0) or 0
+
+            # 2. OUT_OF_STOCK — no available quantity at all
+            if active_qty == 0:
+                issues.append(CartValidationIssue(
+                    sku_id=sku_id,
+                    type=CartValidationIssueType.OUT_OF_STOCK,
+                    message="Товар закончился на складе",
+                ))
+                continue
+
+            # 3. QUANTITY_REDUCED — stock exists but less than requested
+            if 0 < active_qty < row.quantity:
+                issues.append(CartValidationIssue(
+                    sku_id=sku_id,
+                    type=CartValidationIssueType.QUANTITY_REDUCED,
+                    message=f"Доступно только {active_qty} ед. (запрошено {row.quantity})",
+                    old_value=row.quantity,
+                    new_value=active_qty,
+                ))
+
+            # 4. PRICE_CHANGED — current price differs from snapshot stored at add time
+            if row.unit_price_snapshot is not None:
+                current_price: int = max(
+                    0,
+                    (sku_data.get("price") or 0) - (sku_data.get("discount") or 0),
+                )
+                if current_price != row.unit_price_snapshot:
+                    issues.append(CartValidationIssue(
+                        sku_id=sku_id,
+                        type=CartValidationIssueType.PRICE_CHANGED,
+                        message="Цена товара изменилась с момента добавления в корзину",
+                        old_value=row.unit_price_snapshot,
+                        new_value=current_price,
+                    ))
+
+        is_valid = len(issues) == 0
+        return CartValidationResponse(is_valid=is_valid, cart=cart, issues=issues)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
