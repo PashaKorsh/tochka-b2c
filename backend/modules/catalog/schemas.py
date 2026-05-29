@@ -2,6 +2,8 @@
 B2C Catalog Pydantic schemas — aligned with b2c/openapi.yaml.
 
 Key types:
+  CategoryRef              — spec §CategoryRef: {id, name, parent_id, level, path}
+  SellerRef                — spec §CatalogProductCard.seller: {id, display_name}
   CatalogProductCard       — item in the product listing (required: id, name, min_price, has_stock, images).
   PaginatedCatalogProducts — paged response for GET /api/v1/catalog/products.
   CatalogSkuResponse       — SKU in the product detail (NO cost_price / reserved_quantity).
@@ -51,25 +53,73 @@ class ImageRef(BaseModel):
     is_main: Optional[bool] = None
 
 
+# ────────────────────────── Categories ──────────────────────────
+
+class CategoryRef(BaseModel):
+    """
+    spec b2c/openapi.yaml#CategoryRef — flat category representation.
+    required: [id, name, level, path]
+    path: array of strings from root to current (breadcrumb names or slugs).
+
+    Note on list-endpoint population: B2B's ProductPublicShortResponse only
+    provides category_id (UUID). The service builds a partial CategoryRef with
+    id=category_id and name="" / level=0 / path=[] for list items; the detail
+    endpoint does a separate category fetch to populate full fields.
+    """
+    id: UUID
+    name: str
+    parent_id: Optional[UUID] = None
+    level: int
+    path: List[str] = Field(default_factory=list, description="Names from root to current")
+
+
+class CategoryTreeNode(CategoryRef):
+    """
+    spec b2c/openapi.yaml#CategoryTreeNode — nested category node.
+    allOf: CategoryRef + {children: [CategoryTreeNode]}
+    Used in GET /api/v1/catalog/categories/tree.
+    """
+    children: List["CategoryTreeNode"] = []
+
+    model_config = {"from_attributes": True}
+
+
+CategoryTreeNode.model_rebuild()
+
+
+# ────────────────────────── Seller ──────────────────────────
+
+class SellerRef(BaseModel):
+    """
+    spec b2c/openapi.yaml#CatalogProductCard.seller — inline seller object.
+    {id, display_name}
+
+    Note: B2B's ProductPublicResponse only exposes seller_id (UUID).
+    display_name is populated as "" until B2B adds a public seller-profile endpoint.
+    """
+    id: UUID
+    display_name: str = ""
+
+
 # ────────────────────────── Product card ──────────────────────────
 
 class CatalogProductCard(BaseModel):
     """
     spec b2c/openapi.yaml#CatalogProductCard
     required: [id, name, min_price, has_stock, images]
+    optional: category (CategoryRef), seller ({id, display_name})
     """
     id: UUID
     name: str
     slug: Optional[str] = None
-    # category is optional in spec — we only have category_id from B2B short response
-    category_id: Optional[UUID] = None
+    category: Optional[CategoryRef] = None
     min_price: int = Field(..., description="Минимальная цена среди доступных SKU, копейки")
     old_price: Optional[int] = None
-    has_stock: bool = True
+    has_stock: bool
     rating: Optional[float] = None
     reviews_count: Optional[int] = None
     images: List[ImageRef]
-    seller_id: Optional[UUID] = None
+    seller: Optional[SellerRef] = None
 
 
 class PaginatedCatalogProducts(BaseModel):
@@ -134,14 +184,14 @@ class CatalogProductDetail(BaseModel):
     id: UUID
     name: str
     slug: Optional[str] = None
-    category_id: Optional[UUID] = None
+    category: Optional[CategoryRef] = None
     min_price: int
     old_price: Optional[int] = None
     has_stock: bool
     rating: Optional[float] = None
     reviews_count: Optional[int] = None
     images: List[ImageRef]
-    seller_id: Optional[UUID] = None
+    seller: Optional[SellerRef] = None
     # Detail-only fields
     description: str
     characteristics: List[CharacteristicRef] = []
@@ -169,35 +219,6 @@ class FacetsResponse(BaseModel):
     """
     category_id: Optional[UUID] = None
     facets: List[Facet]
-
-
-# ────────────────────────── Categories (US-B2C-05) ──────────────────────────
-
-class CategoryRef(BaseModel):
-    """
-    spec b2c/openapi.yaml#CategoryRef — flat category representation.
-    required: [id, name, level, path]
-    path: array of strings from root to current (breadcrumb names or slugs).
-    """
-    id: UUID
-    name: str
-    parent_id: Optional[UUID] = None
-    level: int
-    path: List[str] = Field(default_factory=list, description="Names from root to current")
-
-
-class CategoryTreeNode(CategoryRef):
-    """
-    spec b2c/openapi.yaml#CategoryTreeNode — nested category node.
-    allOf: CategoryRef + {children: [CategoryTreeNode]}
-    Used in GET /api/v1/catalog/categories/tree.
-    """
-    children: List["CategoryTreeNode"] = []
-
-    model_config = {"from_attributes": True}
-
-
-CategoryTreeNode.model_rebuild()
 
 
 # ────────────────────────── Breadcrumbs (US-B2C-05) ──────────────────────────

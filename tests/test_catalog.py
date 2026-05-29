@@ -371,3 +371,114 @@ async def test_facets_empty_b2b_response(client):
     assert isinstance(data["facets"], list)
     # No facets when no products
     assert data["facets"] == []
+
+
+@pytest.mark.asyncio
+async def test_has_stock_false_when_b2b_returns_zero_price(client):
+    """
+    has_stock is derived from B2B data, not hardcoded.
+    A product with min_price=0 (or missing) should have has_stock=False.
+
+    This guards against silent True if B2B changes its visibility filter
+    and starts returning out-of-stock products.
+    """
+    product_no_stock = {
+        **_make_b2b_product(title="No Stock Item", min_price=0),
+        "min_price": 0,
+    }
+    b2b_resp = _b2b_response([product_no_stock])
+
+    with patch(
+        "backend.modules.catalog.service.httpx.AsyncClient",
+        return_value=_MockAsyncClient(_FakeHttpxResponse(b2b_resp)),
+    ):
+        async with client as ac:
+            resp = await ac.get("/api/v1/catalog/products")
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+    assert item["has_stock"] is False, "min_price=0 should result in has_stock=False"
+
+
+@pytest.mark.asyncio
+async def test_has_stock_true_when_explicit_field_present(client):
+    """
+    If B2B adds an explicit has_stock / in_stock field, it takes precedence
+    over the min_price heuristic.
+    """
+    product = {
+        **_make_b2b_product(title="Stock Item", min_price=0),
+        "has_stock": True,   # explicit field — overrides min_price=0
+        "min_price": 0,
+    }
+    b2b_resp = _b2b_response([product])
+
+    with patch(
+        "backend.modules.catalog.service.httpx.AsyncClient",
+        return_value=_MockAsyncClient(_FakeHttpxResponse(b2b_resp)),
+    ):
+        async with client as ac:
+            resp = await ac.get("/api/v1/catalog/products")
+
+    assert resp.status_code == 200
+    assert resp.json()["items"][0]["has_stock"] is True
+
+
+@pytest.mark.asyncio
+async def test_catalog_item_category_is_object_not_uuid(client):
+    """
+    spec b2c/openapi.yaml#CatalogProductCard.category = CategoryRef object.
+    The response must NOT have a flat category_id field — only the nested
+    category object {id, name, level, path} (name may be empty from B2B short response).
+    """
+    cat_id = str(uuid4())
+    product = _make_b2b_product(title="Widget", category_id=cat_id)
+    b2b_resp = _b2b_response([product])
+
+    with patch(
+        "backend.modules.catalog.service.httpx.AsyncClient",
+        return_value=_MockAsyncClient(_FakeHttpxResponse(b2b_resp)),
+    ):
+        async with client as ac:
+            resp = await ac.get("/api/v1/catalog/products")
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+
+    # Must NOT have flat category_id field
+    assert "category_id" not in item, "spec requires category object, not category_id UUID"
+
+    # Must have nested category object
+    assert "category" in item
+    category = item["category"]
+    assert category is not None
+    assert category["id"] == cat_id
+    # Structural check: required CategoryRef fields must be present
+    assert "name" in category
+    assert "level" in category
+    assert "path" in category
+    assert isinstance(category["path"], list)
+
+
+@pytest.mark.asyncio
+async def test_catalog_item_seller_is_object_not_uuid(client):
+    """
+    spec b2c/openapi.yaml#CatalogProductCard.seller = {id, display_name} object.
+    B2B short response has no seller info, so seller=None is acceptable.
+    The response must NOT have a flat seller_id UUID field.
+    """
+    product = _make_b2b_product(title="Widget")
+    b2b_resp = _b2b_response([product])
+
+    with patch(
+        "backend.modules.catalog.service.httpx.AsyncClient",
+        return_value=_MockAsyncClient(_FakeHttpxResponse(b2b_resp)),
+    ):
+        async with client as ac:
+            resp = await ac.get("/api/v1/catalog/products")
+
+    assert resp.status_code == 200
+    item = resp.json()["items"][0]
+
+    # Must NOT have flat seller_id field
+    assert "seller_id" not in item, "spec requires seller object, not seller_id UUID"
