@@ -31,11 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from backend.modules.catalog.schemas import CatalogProductCard, ImageRef
 from backend.modules.catalog.service import _make_image_ref, _b2b_sku_to_catalog
 from backend.modules.favorites.models import Favorite
-from backend.modules.favorites.schemas import (
-    FavoriteItem,
-    FavoriteMutationResponse,
-    FavoritesListResponse,
-)
+from backend.modules.favorites.schemas import FavoritesListResponse
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -121,62 +117,26 @@ class FavoritesService:
         *,
         user_id: UUID,
         product_id: UUID,
-    ) -> tuple[FavoriteMutationResponse, bool]:
+    ) -> None:
         """
         Idempotently add product to user's favorites.
 
-        Returns (response, created) where created=True means first addition.
-        Uses PostgreSQL ON CONFLICT DO NOTHING for atomicity.
-
-        Canon b2c-cart-flows.md#b2c-6-favorites:
-          First add → 201, repeat → 200 (no error, no duplicate).
+        Spec: PUT /api/v1/favorites/{product_id} → 204 No Content (always).
+        Idempotency: ON CONFLICT DO NOTHING — repeat calls are silent no-ops.
         """
-        now = datetime.now(timezone.utc)
-
         stmt = (
             pg_insert(Favorite)
             .values(
                 user_id=user_id,
                 product_id=product_id,
-                added_at=now,
+                added_at=datetime.now(timezone.utc),
             )
             .on_conflict_do_nothing(
                 constraint="uq_favorites_user_product"
             )
-            .returning(Favorite.id, Favorite.added_at)
         )
-        result = await db.execute(stmt)
+        await db.execute(stmt)
         await db.commit()
-
-        row = result.fetchone()
-        created = row is not None
-
-        if not created:
-            # Fetch the existing added_at
-            existing = await db.execute(
-                select(Favorite).where(
-                    Favorite.user_id == user_id,
-                    Favorite.product_id == product_id,
-                )
-            )
-            fav = existing.scalar_one()
-            added_at = fav.added_at
-        else:
-            added_at = now
-
-        return (
-            FavoriteMutationResponse(
-                product_id=product_id,
-                user_id=user_id,
-                added_at=added_at,
-                message=(
-                    "Товар добавлен в избранное"
-                    if created
-                    else "Товар уже находится в избранном"
-                ),
-            ),
-            created,
-        )
 
     @staticmethod
     async def remove_favorite(
@@ -214,48 +174,46 @@ class FavoritesService:
           1. SELECT product_ids from favorites WHERE user_id=X (all, for total count).
           2. Apply offset/limit to get the current page of product_ids.
           3. POST /api/v1/public/products/batch → only available products.
-          4. Build FavoriteItem[], preserving added_at from DB.
+          4. Build flat CatalogProductCard list; missing IDs silently excluded.
           5. Products absent from B2B response (deleted/blocked) → silently excluded.
           6. total = count of DB rows (regardless of B2B availability).
 
         Raises:
           httpx.ConnectError / httpx.TimeoutException — caller maps to 503.
         """
-        # Step 1 — fetch all product_ids with added_at for this user
-        result = await db.execute(
-            select(Favorite.product_id, Favorite.added_at)
+        # Step 1 — count + paginate in one query
+        from sqlalchemy import func
+        count_result = await db.execute(
+            select(func.count()).select_from(Favorite).where(Favorite.user_id == user_id)
+        )
+        total_count: int = count_result.scalar_one()
+
+        if total_count == 0:
+            return FavoritesListResponse(items=[], total_count=0, limit=limit, offset=offset)
+
+        page_result = await db.execute(
+            select(Favorite.product_id)
             .where(Favorite.user_id == user_id)
             .order_by(Favorite.added_at.desc())
+            .limit(limit)
+            .offset(offset)
         )
-        all_rows: list[tuple[UUID, datetime]] = result.all()
-        total = len(all_rows)
+        page_product_ids: list[UUID] = [row[0] for row in page_result.all()]
 
-        if total == 0:
-            return FavoritesListResponse(items=[], total=0)
+        if not page_product_ids:
+            return FavoritesListResponse(items=[], total_count=total_count, limit=limit, offset=offset)
 
-        # Step 2 — paginate
-        page_rows = all_rows[offset: offset + limit]
-        if not page_rows:
-            return FavoritesListResponse(items=[], total=total)
-
-        page_product_ids = [row[0] for row in page_rows]
-        added_at_map: dict[UUID, datetime] = {row[0]: row[1] for row in page_rows}
-
-        # Step 3 — batch fetch from B2B (returns only available products)
+        # Step 2 — batch fetch from B2B (returns only available products)
         b2b_products = await _batch_fetch_products(
             page_product_ids, b2b_base_url, service_key
         )
 
-        # Step 4 — build response (Step 5: missing IDs silently excluded)
-        items: list[FavoriteItem] = []
+        # Step 3 — build flat CatalogProductCard list; missing IDs silently excluded
+        cards: list[CatalogProductCard] = []
         for pid in page_product_ids:
             data = b2b_products.get(str(pid))
             if data is None:
                 continue   # deleted/blocked in B2B — exclude silently
-            card = _b2b_full_to_card(data)
-            items.append(FavoriteItem(
-                product=card,
-                added_at=added_at_map[pid],
-            ))
+            cards.append(_b2b_full_to_card(data))
 
-        return FavoritesListResponse(items=items, total=total)
+        return FavoritesListResponse(items=cards, total_count=total_count, limit=limit, offset=offset)

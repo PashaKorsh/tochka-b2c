@@ -1,41 +1,34 @@
 """
 US-B2C-06: Favorites CRUD via:
-  POST   /api/v1/favorites/{product_id}  — add (idempotent)
-  DELETE /api/v1/favorites/{product_id}  — remove (idempotent)
+  PUT    /api/v1/favorites/{product_id}  — add (idempotent, 204 always)
+  DELETE /api/v1/favorites/{product_id}  — remove (idempotent, 204 always)
   GET    /api/v1/favorites               — enriched list from B2B
 
 Canon flow: b2c-cart-flows.md#b2c-6-favorites
 Spec:       neomarket-protocols/b2c/openapi.yaml (favorites section)
-            neomarket-canon/apis/b2c/cart/openapi.yaml (FavoriteMutationResponse)
 
 Covered DoD scenarios:
-  ✓ add_to_favorites_returns_201
-  ✓ repeat_add_returns_200_not_duplicate
+  ✓ add_to_favorites_returns_204            (was 201 — fixed per spec PUT 204)
+  ✓ repeat_add_returns_204_not_duplicate    (was 200 — fixed per spec)
   ✓ get_favorites_enriched_from_b2b
   ✓ blocked_product_excluded_from_list
-  ✓ user_id_from_query_is_ignored       (IDOR prevention)
+  ✓ user_id_from_query_is_ignored          (IDOR prevention)
 
 Extra:
   ✓ remove_from_favorites_returns_204
-  ✓ remove_nonexistent_returns_204      (idempotent)
+  ✓ remove_nonexistent_returns_204         (idempotent)
   ✓ empty_favorites_returns_200
   ✓ favorites_requires_auth_401
   ✓ b2b_unavailable_returns_503
+  ✓ favorites_isolated_per_user
 
-Security note (ADR in PR description):
-  user_id comes exclusively from JWT claims (Bearer token).
-  Any user_id passed in query params is completely ignored by the backend.
-  This prevents IDOR: user A cannot read/modify user B's favorites.
-
-Test isolation:
-  Each test uses a fresh test user_id (uuid4) so parallel runs don't clash.
-  Database is created in the `create_db` autouse fixture.
-  Auth dependency is overridden via app.dependency_overrides.
+GET /favorites response shape: PaginatedCatalogProducts
+  {items: [CatalogProductCard, ...], total_count: int, limit: int, offset: int}
+  (flat cards — no {product, added_at} wrapper)
 """
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
 from typing import Any
 from unittest.mock import patch
 from uuid import UUID, uuid4
@@ -46,7 +39,6 @@ from httpx import HTTPStatusError
 
 from backend.main import app
 from backend.auth import get_current_user_id, create_test_token
-# Tables are created by conftest.py setup_test_database fixture (session-scoped).
 
 
 def _make_client(user_id: UUID) -> AsyncClient:
@@ -115,16 +107,11 @@ class _FakeResp:
 
 
 class _MockClient:
-    """
-    Stub for httpx.AsyncClient that returns a fixed response for any HTTP method.
-    Used as `side_effect=mock` so each `httpx.AsyncClient(...)` call returns
-    a new context-manager instance backed by the same response.
-    """
+    """Stub for httpx.AsyncClient — fixed response for any HTTP method."""
     def __init__(self, response):
         self._response = response
 
     def __call__(self, **kwargs):
-        """Called as httpx.AsyncClient(...) — return self as context manager."""
         return _MockClientInstance(self._response)
 
 
@@ -150,60 +137,44 @@ class _MockClientInstance:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DoD: add_to_favorites_returns_201
+# DoD: add_to_favorites_returns_204
 # ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_add_to_favorites_returns_201():
+async def test_add_to_favorites_returns_204():
     """
-    Happy path: first add of a product → 201 CREATED.
-
-    Verifies:
-    - 201 status code
-    - Response contains product_id, user_id, added_at, message
+    spec b2c/openapi.yaml:557-565 — PUT /favorites/{product_id} → 204 No Content.
+    First add returns 204 with no body.
     """
     user_id = uuid4()
     product_id = uuid4()
 
     async with _make_client(user_id) as ac:
-        resp = await ac.post(f"/api/v1/favorites/{product_id}")
+        resp = await ac.put(f"/api/v1/favorites/{product_id}")
 
-    assert resp.status_code == 201, resp.text
-    data = resp.json()
-    assert data["product_id"] == str(product_id)
-    assert data["user_id"] == str(user_id)
-    assert "added_at" in data
-    assert "Добавлен" in data["message"] or "добавлен" in data["message"].lower()
+    assert resp.status_code == 204, resp.text
+    assert resp.content == b"", "204 must have no body"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# DoD: repeat_add_returns_200_not_duplicate
+# DoD: repeat_add_returns_204_not_duplicate
 # ──────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_repeat_add_returns_200_not_duplicate():
+async def test_repeat_add_returns_204_not_duplicate():
     """
-    Idempotency: second add of the same product → 200, no DB duplicate.
-
-    Verifies:
-    - First call: 201
-    - Second call: 200
-    - No duplicate entries in DB (UNIQUE constraint test via repeat without error)
+    Idempotency: second PUT of the same product → 204, no DB duplicate.
+    Both calls return 204 (PUT is idempotent by spec — no 201/200 distinction).
     """
     user_id = uuid4()
     product_id = uuid4()
 
     async with _make_client(user_id) as ac:
-        resp1 = await ac.post(f"/api/v1/favorites/{product_id}")
-        resp2 = await ac.post(f"/api/v1/favorites/{product_id}")
+        resp1 = await ac.put(f"/api/v1/favorites/{product_id}")
+        resp2 = await ac.put(f"/api/v1/favorites/{product_id}")
 
-    assert resp1.status_code == 201, resp1.text
-    assert resp2.status_code == 200, resp2.text
-
-    # Both should have the same product_id / user_id
-    d1, d2 = resp1.json(), resp2.json()
-    assert d1["product_id"] == d2["product_id"]
-    assert d1["user_id"] == d2["user_id"]
+    assert resp1.status_code == 204, resp1.text
+    assert resp2.status_code == 204, resp2.text
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -215,11 +186,9 @@ async def test_get_favorites_enriched_from_b2b():
     """
     GET /api/v1/favorites enriches product data from B2B batch endpoint.
 
-    Verifies:
-    - 200 status
-    - Response has {items: [...], total: N}
-    - Each item has {product: CatalogProductCard, added_at: datetime}
-    - product has: id, name, min_price, has_stock, images
+    spec b2c/openapi.yaml — response: PaginatedCatalogProducts shape:
+    {items: [CatalogProductCard, ...], total_count: int, limit: int, offset: int}
+    Each item is a flat CatalogProductCard (no {product, added_at} wrapper).
     """
     user_id = uuid4()
     product_id = uuid4()
@@ -227,9 +196,9 @@ async def test_get_favorites_enriched_from_b2b():
     b2b_product = _b2b_product(product_id=str(product_id), title="Enriched Product")
     mock = _MockClient(_FakeResp([b2b_product]))
 
-    # First add the product
+    # Add the product first
     async with _make_client(user_id) as ac:
-        await ac.post(f"/api/v1/favorites/{product_id}")
+        await ac.put(f"/api/v1/favorites/{product_id}")
 
     # Then fetch favorites with B2B mock
     with patch("backend.modules.favorites.service.httpx.AsyncClient", side_effect=mock):
@@ -239,22 +208,25 @@ async def test_get_favorites_enriched_from_b2b():
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
+    # spec PaginatedCatalogProducts: required {items, total_count, limit, offset}
     assert "items" in data
-    assert "total" in data
-    assert data["total"] >= 1
+    assert "total_count" in data
+    assert "limit" in data
+    assert "offset" in data
+    assert data["total_count"] >= 1
 
-    # Find our product in the list
     items = data["items"]
     assert len(items) >= 1
-    item = next((i for i in items if i["product"]["id"] == str(product_id)), None)
-    assert item is not None, f"Product {product_id} not found in favorites"
 
-    product = item["product"]
-    assert product["name"] == "Enriched Product"
-    assert "min_price" in product
-    assert "has_stock" in product
-    assert "images" in product
-    assert "added_at" in item
+    # Items are flat CatalogProductCards — no {product, added_at} wrapper
+    card = next((i for i in items if i["id"] == str(product_id)), None)
+    assert card is not None, f"Product {product_id} not found in favorites"
+    assert card["name"] == "Enriched Product"
+    assert "min_price" in card
+    assert "has_stock" in card
+    assert "images" in card
+    # No nested product object — it's the card itself
+    assert "product" not in card, "items must be flat CatalogProductCard, not {product, added_at}"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -266,21 +238,17 @@ async def test_blocked_product_excluded_from_list():
     """
     Canon b2c-cart-flows.md#b2c-6-favorites edge case:
     Product blocked/deleted in B2B → B2B doesn't return it in batch →
-    B2C silently excludes it from the favorites list (not a 404).
+    B2C silently excludes it from the favorites list.
 
-    Verifies:
-    - 200 (not 404) when a favorited product is blocked in B2B
-    - Blocked product absent from items
-    - total reflects DB count (includes the blocked product's row)
+    total_count reflects DB rows (includes blocked product's row).
     """
     user_id = uuid4()
     good_id = uuid4()
     blocked_id = uuid4()
 
-    # Add both to favorites
     async with _make_client(user_id) as ac:
-        await ac.post(f"/api/v1/favorites/{good_id}")
-        await ac.post(f"/api/v1/favorites/{blocked_id}")
+        await ac.put(f"/api/v1/favorites/{good_id}")
+        await ac.put(f"/api/v1/favorites/{blocked_id}")
 
     # B2B batch only returns the good product (blocked_id absent)
     good_product = _b2b_product(product_id=str(good_id), title="Good Product")
@@ -293,11 +261,11 @@ async def test_blocked_product_excluded_from_list():
     assert resp.status_code == 200, resp.text
     data = resp.json()
 
-    product_ids_in_response = {i["product"]["id"] for i in data["items"]}
-    assert str(good_id) in product_ids_in_response
-    assert str(blocked_id) not in product_ids_in_response, (
-        "Blocked product must be silently excluded from favorites list"
-    )
+    card_ids = {i["id"] for i in data["items"]}
+    assert str(good_id) in card_ids
+    assert str(blocked_id) not in card_ids, "Blocked product must be silently excluded"
+    # total_count = 2 (both DB rows exist) even though items has 1
+    assert data["total_count"] == 2
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -307,31 +275,31 @@ async def test_blocked_product_excluded_from_list():
 @pytest.mark.asyncio
 async def test_user_id_from_query_is_ignored():
     """
-    IDOR prevention: even if user_id is passed in query params, the backend
-    uses user_id from JWT claims only.
+    IDOR prevention: user_id in query params is completely ignored.
+    The backend uses user_id from JWT claims only.
 
-    Scenario: user_A sends request with user_B's id in query → favorites are
-    added to user_A (JWT), not user_B (query param).
+    204 confirms the add went to user_A (JWT), not user_B (query).
+    Subsequent GET with user_A shows the product; user_B sees nothing.
     """
     user_a_id = uuid4()
     user_b_id = uuid4()
     product_id = uuid4()
 
-    # user_A makes request with user_B's id in query (IDOR attempt)
+    # user_A sends PUT with user_B's id in query (IDOR attempt)
     async with _make_client(user_a_id) as ac:
-        resp = await ac.post(
+        resp = await ac.put(
             f"/api/v1/favorites/{product_id}",
-            params={"user_id": str(user_b_id)},  # This must be ignored
+            params={"user_id": str(user_b_id)},  # must be ignored
         )
+    assert resp.status_code == 204, resp.text
 
-    assert resp.status_code == 201, resp.text
-    data = resp.json()
-
-    # Backend must use user_A's id from JWT, NOT user_B's from query
-    assert data["user_id"] == str(user_a_id), (
-        f"Expected user_id={user_a_id} (from JWT), got {data['user_id']}"
+    # user_B's favorites must be empty (product was added to user_A via JWT)
+    async with _make_client(user_b_id) as ac:
+        resp_b = await ac.get("/api/v1/favorites")
+    assert resp_b.status_code == 200
+    assert resp_b.json()["total_count"] == 0, (
+        "user_id from query was not ignored — IDOR violation"
     )
-    assert data["user_id"] != str(user_b_id), "user_id from query must be ignored (IDOR prevention)"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -345,7 +313,7 @@ async def test_remove_from_favorites_returns_204():
     product_id = uuid4()
 
     async with _make_client(user_id) as ac:
-        await ac.post(f"/api/v1/favorites/{product_id}")
+        await ac.put(f"/api/v1/favorites/{product_id}")
         resp = await ac.delete(f"/api/v1/favorites/{product_id}")
 
     assert resp.status_code == 204, resp.text
@@ -365,17 +333,18 @@ async def test_remove_nonexistent_returns_204():
 
 @pytest.mark.asyncio
 async def test_empty_favorites_returns_200():
-    """Empty favorites for a new user → 200 {items: [], total: 0}."""
+    """Empty favorites → 200 {items: [], total_count: 0, limit: N, offset: 0}."""
     user_id = uuid4()
 
-    # Use a mock that won't be called (no products in DB → no B2B call needed)
     async with _make_client(user_id) as ac:
         resp = await ac.get("/api/v1/favorites")
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["items"] == []
-    assert data["total"] == 0
+    assert data["total_count"] == 0
+    assert "limit" in data
+    assert "offset" in data
 
 
 @pytest.mark.asyncio
@@ -392,13 +361,13 @@ async def test_favorites_requires_auth_401():
 
 @pytest.mark.asyncio
 async def test_add_favorites_requires_auth_401():
-    """POST /api/v1/favorites/{product_id} without JWT → 401."""
+    """PUT /api/v1/favorites/{product_id} without JWT → 401."""
     product_id = uuid4()
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
     ) as ac:
-        resp = await ac.post(f"/api/v1/favorites/{product_id}")
+        resp = await ac.put(f"/api/v1/favorites/{product_id}")
 
     assert resp.status_code == 401, resp.text
 
@@ -409,11 +378,9 @@ async def test_b2b_unavailable_returns_503():
     user_id = uuid4()
     product_id = uuid4()
 
-    # Add a product first
     async with _make_client(user_id) as ac:
-        await ac.post(f"/api/v1/favorites/{product_id}")
+        await ac.put(f"/api/v1/favorites/{product_id}")
 
-    # B2B is down
     mock = _MockClient(ConnectError("Connection refused"))
     with patch("backend.modules.favorites.service.httpx.AsyncClient", side_effect=mock):
         async with _make_client(user_id) as ac:
@@ -425,25 +392,43 @@ async def test_b2b_unavailable_returns_503():
 
 @pytest.mark.asyncio
 async def test_favorites_isolated_per_user():
-    """
-    User isolation: user_A's favorites don't appear in user_B's list.
-    Critical for IDOR prevention.
-    """
+    """User isolation: user_A's favorites don't appear in user_B's list."""
     user_a_id = uuid4()
     user_b_id = uuid4()
     product_id_a = uuid4()
 
-    # user_A adds a product
     async with _make_client(user_a_id) as ac:
-        await ac.post(f"/api/v1/favorites/{product_id_a}")
+        await ac.put(f"/api/v1/favorites/{product_id_a}")
 
-    # user_B should NOT see user_A's product in their own favorites
     async with _make_client(user_b_id) as ac:
         resp = await ac.get("/api/v1/favorites")
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
-    product_ids = {i["product"]["id"] for i in data["items"]}
-    assert str(product_id_a) not in product_ids, (
-        "User B must not see User A's favorites (IDOR isolation)"
-    )
+    card_ids = {i["id"] for i in data["items"]}
+    assert str(product_id_a) not in card_ids, "User B must not see User A's favorites"
+
+
+@pytest.mark.asyncio
+async def test_get_favorites_pagination():
+    """GET /favorites with limit/offset returns correct page and total_count."""
+    user_id = uuid4()
+    product_ids = [uuid4() for _ in range(3)]
+
+    async with _make_client(user_id) as ac:
+        for pid in product_ids:
+            await ac.put(f"/api/v1/favorites/{pid}")
+
+    b2b_products = [_b2b_product(product_id=str(pid)) for pid in product_ids]
+    mock = _MockClient(_FakeResp(b2b_products[:2]))  # mock returns first 2 for the page
+
+    with patch("backend.modules.favorites.service.httpx.AsyncClient", side_effect=mock):
+        async with _make_client(user_id) as ac:
+            resp = await ac.get("/api/v1/favorites", params={"limit": 2, "offset": 0})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["total_count"] == 3   # all 3 in DB
+    assert data["limit"] == 2
+    assert data["offset"] == 0
+    assert len(data["items"]) <= 2

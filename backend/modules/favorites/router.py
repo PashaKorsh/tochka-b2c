@@ -1,24 +1,18 @@
 """
 Favorites router — US-B2C-06.
 
-Paths (canon b2c-cart-flows.md#b2c-6-favorites, spec b2c/openapi.yaml):
-  POST   /api/v1/favorites/{product_id} — add (idempotent, 201 first / 200 repeat)
+Paths (spec b2c/openapi.yaml — source of truth per CLAUDE.md §3):
+  PUT    /api/v1/favorites/{product_id} — add (idempotent, 204 always)
   DELETE /api/v1/favorites/{product_id} — remove (idempotent, 204 always)
   GET    /api/v1/favorites              — paginated + enriched from B2B
 
 Contract notes:
-  • user_id — ONLY from JWT claims (Bearer). NEVER from query or body.
-    If user_id appears in query params → ignored (IDOR prevention).
-    CLAUDE.md §5, canon b2c-cart-flows.md §1.
-  • POST idempotency: ON CONFLICT DO NOTHING in DB. 201 = created, 200 = already exists.
+  • user_id — ONLY from JWT claims (Bearer). NEVER from query or body (IDOR prevention).
+  • PUT idempotency: ON CONFLICT DO NOTHING in DB. 204 regardless of first/repeat.
   • DELETE idempotency: 204 even if the row doesn't exist.
-  • GET enriches via B2B batch: unavailable products silently excluded.
+  • GET returns PaginatedCatalogProducts shape: {items, total_count, limit, offset}.
   • Auth: 401 UNAUTHORIZED on missing/invalid JWT.
-  • B2B unavailable: 503 UPSTREAM_UNAVAILABLE (canon uses 503 for cart/favorites
-    vs 502 for catalog; following canon distinction here).
-
-ADR — user identification (in PR description):
-  See backend/auth.py.
+  • B2B unavailable: 503 UPSTREAM_UNAVAILABLE.
 """
 from __future__ import annotations
 
@@ -27,15 +21,13 @@ from uuid import UUID
 
 import httpx
 from fastapi import APIRouter, Depends, Path, Query
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse
+from fastapi.responses import Response
 
 from backend import config
 from backend.auth import get_current_user_id
 from backend.database import get_db
-from backend.modules.favorites.schemas import (
-    FavoriteMutationResponse,
-    FavoritesListResponse,
-)
+from backend.modules.favorites.schemas import FavoritesListResponse
 from backend.modules.favorites.service import FavoritesService
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,17 +42,16 @@ def _upstream_error(detail: str) -> JSONResponse:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# POST /api/v1/favorites/{product_id}
+# PUT /api/v1/favorites/{product_id}
 # ──────────────────────────────────────────────────────────────────────────────
 
-@router.post(
+@router.put(
     "/favorites/{product_id}",
     summary="Add product to favorites (idempotent)",
-    status_code=201,
+    status_code=204,
     response_model=None,
     responses={
-        201: {"description": "Added for the first time"},
-        200: {"description": "Already in favorites (idempotent)"},
+        204: {"description": "Added (or already in favorites — idempotent)"},
         401: {"description": "Unauthorized"},
     },
 )
@@ -68,27 +59,20 @@ async def add_to_favorites(
     product_id: UUID = Path(..., description="Product UUID"),
     db: AsyncSession = Depends(get_db),
     user_id: UUID = Depends(get_current_user_id),
-) -> JSONResponse:
+) -> Response:
     """
-    POST /api/v1/favorites/{product_id} — add to favorites.
+    PUT /api/v1/favorites/{product_id} — add to favorites (spec b2c/openapi.yaml:557-565).
 
-    DoD (US-B2C-06):
-    - add_to_favorites_returns_201        — first add → 201
-    - repeat_add_returns_200_not_duplicate — repeat → 200, no DB duplicate
-
-    user_id extracted from JWT claims only (IDOR prevention).
-    Any user_id in query params is silently ignored.
+    204 No Content always (first add and repeat are indistinguishable to the client).
+    Idempotency guaranteed by ON CONFLICT DO NOTHING at DB level.
+    user_id from JWT only — IDOR prevention.
     """
-    response, created = await FavoritesService.add_favorite(
+    await FavoritesService.add_favorite(
         db,
         user_id=user_id,
         product_id=product_id,
     )
-    status_code = 201 if created else 200
-    return JSONResponse(
-        status_code=status_code,
-        content=response.model_dump(mode="json"),
-    )
+    return Response(status_code=204)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
