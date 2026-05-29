@@ -43,6 +43,7 @@ from backend.modules.catalog.schemas import (
     FacetsResponse,
     ImageRef,
     PaginatedCatalogProducts,
+    SellerRef,
 )
 
 
@@ -65,16 +66,36 @@ def _make_image_ref(cover_image_url: Optional[str]) -> list[ImageRef]:
 
 
 def _b2b_item_to_card(item: dict[str, Any]) -> CatalogProductCard:
-    """Transform a B2B ProductPublicShortResponse dict into a CatalogProductCard."""
+    """Transform a B2B ProductPublicShortResponse dict into a CatalogProductCard.
+
+    category: B2B short response only provides category_id (UUID). We build a
+    partial CategoryRef with id=category_id and empty name/path — the detail
+    endpoint does a full category fetch to populate those fields.
+
+    has_stock: derived from B2B data. B2B only returns products with
+    active_quantity > 0 (filtered before response), so any item with min_price > 0
+    is in stock. Falls back gracefully if B2B adds explicit has_stock / in_stock.
+    """
+    cat_id = item.get("category_id")
+    category = (
+        CategoryRef(id=UUID(cat_id), name="", level=0, path=[]) if cat_id else None
+    )
+
+    has_stock = bool(
+        item.get("has_stock",
+        item.get("in_stock",
+        (item.get("min_price") or 0) > 0))
+    )
+
     return CatalogProductCard(
         id=UUID(item["id"]),
         name=item["title"],
         slug=item.get("slug"),
-        category_id=UUID(item["category_id"]) if item.get("category_id") else None,
+        category=category,
         min_price=item["min_price"],
-        has_stock=True,   # B2B only returns in-stock products
+        has_stock=has_stock,
         images=_make_image_ref(item.get("cover_image")),
-        seller_id=None,   # not exposed in B2B short response
+        seller=None,   # seller info not in B2B short response
     )
 
 
@@ -308,15 +329,23 @@ def _b2b_product_to_detail(data: dict[str, Any]) -> CatalogProductDetail:
     raw_chars = data.get("characteristics", [])
     characteristics = [CharacteristicRef(name=c["name"], value=c["value"]) for c in raw_chars]
 
+    cat_id = data.get("category_id")
+    category = (
+        CategoryRef(id=UUID(cat_id), name="", level=0, path=[]) if cat_id else None
+    )
+
+    seller_id = data.get("seller_id")
+    seller = SellerRef(id=UUID(seller_id), display_name="") if seller_id else None
+
     return CatalogProductDetail(
         id=UUID(data["id"]),
         name=data["title"],
         slug=data.get("slug"),
-        category_id=UUID(data["category_id"]) if data.get("category_id") else None,
+        category=category,
         min_price=min_price,
         has_stock=has_stock,
         images=images,
-        seller_id=UUID(data["seller_id"]) if data.get("seller_id") else None,
+        seller=seller,
         description=data.get("description", ""),
         characteristics=characteristics,
         skus=skus,
