@@ -19,6 +19,7 @@ Facets strategy (ADR in PR description):
 """
 from __future__ import annotations
 
+import random
 import uuid
 from typing import Any, Optional
 from uuid import UUID
@@ -413,36 +414,43 @@ async def _get_similar(
 ) -> list[CatalogProductCard] | None:
     """
     Return up to `limit` public products from the same category as `product_id`,
-    excluding the product itself.
+    excluding the product itself.  Results are randomly shuffled so each page-load
+    shows variety without relying on B2B ordering.
 
     Algorithm (canon b2c-catalog-flows.md#b2c-4-similar-products):
-      1. Fetch the target product from B2B to get its category_id and validate existence.
-         Returns None if product is unknown / deleted / blocked (→ 404 to caller).
-      2. Fetch visible products in that category from B2B (limit+1 to have room after
-         excluding self).
-      3. Filter out the target product from the result.
-      4. Return up to `limit` items as CatalogProductCard list.
-
-    Fallback to parent category (canon §4, step 3) is NOT implemented in this MVP —
-    B2C has no category-hierarchy endpoint to resolve parent_id. Tracked as tech-debt;
-    add once GET /api/v1/catalog/categories/tree is consumed.
+      1. Fetch the target product from B2B → validate visibility, get category_id.
+         Returns None if product is unknown / deleted / blocked (→ 404).
+      2. Fetch a wider batch (max(limit*3, 30) items) from B2B in the same category.
+         Requesting a larger batch compensates for self-exclusion and gives enough
+         variety for the random shuffle.
+      3. Exclude the target product from the result.
+      4. If len(similar) < limit → try parent-category fallback (canon §4 step 3):
+           a. GET /api/v1/categories/{category_id} → resolve parent_id.
+           b. Fetch up to max(limit*3, 30) products from parent category.
+           c. Merge (deduplicated) into `similar`.
+         Fallback failures (network, no parent_id) are swallowed — return whatever
+         we have from the primary category rather than erroring out.
+      5. Shuffle `similar` in-place for variety, cap at `limit`, convert and return.
 
     ADR (similar products algorithm) — three approaches considered:
-      (a) Random sample (ORDER BY RANDOM()) — chosen. Zero config, each page-load
-          shows variety, no caching needed. Downside: not reproducible across reloads.
-      (b) Characteristic-match score (COUNT of shared attrs) — better relevance, but
-          requires B2B to expose the scoring logic (new endpoint) and full
-          characteristics per item.
-      (c) Pre-computed recommendation cache — best quality, but adds ML infra and
-          cache invalidation complexity. Out of scope for MVP.
-    Criteria: (1) implementation complexity — approach (a) is a single B2B query;
-    (2) result variety — random keeps the block fresh on every reload without extra infra.
+      (a) B2B random sort: B2B's /api/v1/public/products has no `sort=random` param.
+          Not available without B2B changes.
+      (b) Random offset before fetch: requires a separate total-count call to compute
+          a safe offset range → 2 extra B2B requests per similar-block load.
+      (c) Wider fetch + B2C shuffle (chosen): fetch limit*3 items, shuffle on B2C.
+          One extra HTTP call vs the minimal case; gives variety for typical category
+          sizes (>10 visible products). For sparse categories (<limit visible), the
+          parent-category fallback adds items from a broader pool.
+    Criteria: (1) no B2B changes; (2) one extra B2B call at most (vs 2 for option b);
+    (3) random.shuffle is deterministically seedable in tests.
 
     Raises:
-      httpx.ConnectError / httpx.TimeoutException — caller maps to 502.
+      httpx.ConnectError / httpx.TimeoutException — caller maps to 502 (step 1 & 2 only;
+      fallback swallows network errors to stay non-blocking).
     """
-    # Step 1 — verify product exists and get its category_id
     headers = {"X-Service-Key": service_key}
+
+    # Step 1 — verify product exists and get its category_id
     async with httpx.AsyncClient(timeout=10.0) as client:
         product_resp = await client.get(
             f"{b2b_base_url}/api/v1/products/{product_id}",
@@ -450,19 +458,19 @@ async def _get_similar(
         )
 
     if product_resp.status_code == 404:
-        return None   # caller will return 404
+        return None
     product_resp.raise_for_status()
 
     product_data = product_resp.json()
-    # Deleted / non-MODERATED → treat as not found
     if product_data.get("deleted") or product_data.get("status") != "MODERATED":
         return None
 
     category_id: str = product_data.get("category_id", "")
 
-    # Step 2 — fetch visible products in the same category (request one extra)
+    # Step 2 — fetch a wider batch for variety + self-exclusion headroom
+    fetch_count = max(limit * 3, 30)
     params: dict[str, Any] = {
-        "limit": limit + 1,
+        "limit": fetch_count,
         "offset": 0,
         "sort": "date_desc",
     }
@@ -482,7 +490,47 @@ async def _get_similar(
     # Step 3 — exclude current product
     similar = [i for i in items if i["id"] != str(product_id)]
 
-    # Step 4 — cap at limit and convert
+    # Step 4 — parent-category fallback when primary category is sparse
+    if len(similar) < limit and category_id:
+        parent_id: str | None = None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as cat_client:
+                cat_resp = await cat_client.get(
+                    f"{b2b_base_url}/api/v1/categories/{category_id}",
+                    headers=headers,
+                )
+            if cat_resp.status_code == 200:
+                parent_id = cat_resp.json().get("parent_id")
+        except (httpx.ConnectError, httpx.TimeoutException):
+            pass  # fallback skipped gracefully
+
+        if parent_id:
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as parent_client:
+                    parent_resp = await parent_client.get(
+                        f"{b2b_base_url}/api/v1/public/products",
+                        params={
+                            "limit": fetch_count,
+                            "offset": 0,
+                            "sort": "date_desc",
+                            "category": parent_id,
+                        },
+                        headers=headers,
+                    )
+                parent_resp.raise_for_status()
+                parent_items = parent_resp.json().get("items", [])
+
+                # Merge: add parent items not already present and not the target product
+                existing_ids = {i["id"] for i in similar} | {str(product_id)}
+                for item in parent_items:
+                    if item["id"] not in existing_ids:
+                        similar.append(item)
+                        existing_ids.add(item["id"])
+            except (httpx.ConnectError, httpx.TimeoutException):
+                pass  # return primary results if parent fetch fails
+
+    # Step 5 — shuffle for variety, cap at limit
+    random.shuffle(similar)
     return [_b2b_item_to_card(i) for i in similar[:limit]]
 
 
